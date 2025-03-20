@@ -27,6 +27,7 @@
     <Compile Include="cm_loader.py" />
     <Compile Include="cm_logging.py" />
     <Compile Include="cm_main.py" />
+    <Compile Include="cm_controller.py" />
     <Compile Include="cm_player.py" />
     <Compile Include="cm_settings.py" />
   </ItemGroup>

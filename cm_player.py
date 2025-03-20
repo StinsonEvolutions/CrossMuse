@@ -1,4 +1,4 @@
-"""Audio playback module with multiprocessing integration."""
+"""Model: Audio playback module with multiprocessing integration."""
 import logging
 import queue
 import threading
@@ -12,7 +12,7 @@ import sounddevice as sd
 from cm_settings import AudioConfig
 from cm_logging import setup_logger
 
-logger = setup_logger(__name__, level=logging.INFO)
+logger = setup_logger()
 
 class AtomicBuffer:
     """Thread-safe audio buffer using numpy"""
@@ -93,18 +93,20 @@ class AudioPlayer:
         self.stop_event = threading.Event()
         self.prefill_complete = threading.Event()
         self.loader_complete = False
-        self.clips_played = 0
+        self.clips_buffered = 0
+        self.paused = False
+        self.current_volume = 1.0
+        self.fade_step = 0.02  # 20ms per step
+        self.fade_duration = config.pause_fade
         self._peak_limiter = PeakLimiter(config)
         self._buffer_thread = threading.Thread(target=self._buffer_loop)
 
-    def start(self) -> None:
-        """Start audio playback system."""
+    def start(self, command_queue: queue.Queue) -> None:
+        """Start audio playback system with command queue for IPC."""
         try:
-        
-            # Wait for the first song to be processed and ready before opening our stream
-            #test = self.processed_clips_queue.get()
-            #logger.debug(f"Found processed clip: {test[0]}, {len(test[1])}")
+            logger.info("Starting playback...")
             
+            # Open audio stream
             with sd.OutputStream(
                 samplerate=self.config.sample_rate,
                 channels=self.config.channels,
@@ -113,8 +115,31 @@ class AudioPlayer:
                 callback=self._audio_callback
             ) as stream:
                 self.stream = stream
+                
+                # Start buffering thread
                 self._buffer_thread.start()
-                self._wait_until_complete()
+
+                # Process commands from the main process
+                while not self.stop_event.is_set():
+                    try:
+                        cmd = command_queue.get_nowait()
+                        if cmd == "PAUSE":
+                            logger.info("Playback paused")
+                            self._handle_pause_fade()
+                        elif cmd == "RESUME":
+                            logger.info("Playback resumed")
+                            self._handle_resume_fade()
+                        elif cmd == "STOP":
+                            logger.info("Stopping playback...")
+                            break
+                    except queue.Empty:
+                        pass
+
+                    if self.is_playback_complete():
+                        logger.info("Playback complete")
+                        break
+
+                    time.sleep(0.1)
 
         except Exception as e:
             logger.error("Playback failed: %s", str(e))
@@ -124,20 +149,19 @@ class AudioPlayer:
     def _buffer_loop(self) -> None:
         """Unified buffering loop handling both prefill and continuous loading."""
         start_time = time.time()
-        logging.info("Starting buffering system (target: %.1fs)", self.config.prefill_time)
+        logger.info("Starting buffering system (target: %.1fs)", self.config.prefill_time)
 
         while not self.stop_event.is_set():
-            # Process queue items
             try:
                 index, clip = self.processed_clips_queue.get(timeout=0.1)
                 if (index, clip) == (None, None):
                     self.loader_complete = True
-                    logging.debug("Received loader completion signal")
+                    logger.debug("Received loader completion signal")
                     break
                 
                 self._safe_buffer(clip)
-                self.clips_played += 1
-                logging.debug("Buffered clip %d (Total: %d)", index, self.clips_played)
+                self.clips_buffered += 1
+                logger.debug("Buffered clip %d (Total: %d)", index, self.clips_buffered)
 
             except queue.Empty:
                 if self.loader_complete:
@@ -150,76 +174,103 @@ class AudioPlayer:
                 
                 if buffer_level >= self.config.prefill_time:
                     self.prefill_complete.set()
-                    logging.info("Prefill target reached (%.1fs)", buffer_level)
-                elif elapsed > self.config.prebuffer_timeout:
+                    logger.info("Prefill target reached (%.1fs)", buffer_level)
+                elif self.loader_complete:
                     self.prefill_complete.set()
-                    logging.warning("Prefill timeout reached (%.1fs), starting with %.1fs buffer", 
-                                  self.config.prebuffer_timeout, buffer_level)
+                    logger.info("Loader complete, starting with %.1fs buffer", buffer_level)
 
-        logging.info("Buffering completed, final buffer level: %.1fs", 
-                    self.buffer.available_seconds())
+        logger.info(
+            "Buffering completed, final buffer level: %.1fs", 
+            self.buffer.available_seconds()
+        )
 
     def _safe_buffer(self, audio: np.ndarray) -> None:
         """Safely write audio data to buffer with flow control."""
         total_written = 0
         while total_written < len(audio) and not self.stop_event.is_set():
-            chunk = audio[total_written:total_written + self.config.block_size]
+            chunk = audio[total_written : total_written + self.config.block_size]
             written = self.buffer.write(chunk)
             
             if written > 0:
                 total_written += written
             else:
-                self._handle_buffer_full()
-
-    def _handle_buffer_full(self) -> None:
-        """Manage buffer full conditions with backoff."""
-        buffer_level = self.buffer.available_seconds() / self.config.buffer_seconds
-        time.sleep(self.config.buffer_backoff)
+                time.sleep(self.config.buffer_backoff)
 
     def _audio_callback(self, outdata: np.ndarray, frames: int, 
                       time_info: dict, status: sd.CallbackFlags) -> None:
         """Core audio callback handling buffer reading and signal processing."""
         if status:
             logger.warning("Audio device status: %s", status)
-        
-        if self.is_playback_complete():
-            self.stop()
+            
+        if self.paused or (not self.prefill_complete.is_set() and not self.loader_complete):
             outdata.fill(0)
             return
-
-        # Wait for minimum buffer before starting playback
-        data = None
-        if self.prefill_complete.is_set():
-            data = self.buffer.read(frames)
-
+        
+        data = self.buffer.read(frames)
+        
         if data is None:
             outdata.fill(0)
             return
 
-        self._peak_limiter.apply(data)
-        outdata[:] = data
+        # Apply volume adjustment (for pause fading)
+        data *= self.current_volume
 
-    def _wait_until_complete(self) -> None:
-        """Maintain playback until completion or stop signal."""
-        while not self.is_playback_complete() and not self.stop_event.is_set():
-            time.sleep(0.1)
+        # Apply peak limiting to prevent clipping
+        self._peak_limiter.apply(data)
+        
+        outdata[:] = data
+        
+    def _handle_pause_fade(self):
+        target_time = time.time() + self.fade_duration
+        while time.time() < target_time and not self.stop_event.is_set():
+            self.current_volume = max(0, (target_time - time.time()) / self.fade_duration)
+            time.sleep(0.01)
+        self.current_volume = 0
+        self.paused = True
+
+    def _handle_resume_fade(self):
+        self.paused = False
+        start_time = time.time()
+        while self.current_volume < 1.0 and not self.stop_event.is_set():
+            self.current_volume = min(1.0, (time.time() - start_time) / self.fade_duration)
+            time.sleep(0.01)
+        self.current_volume = 1.0
 
     def is_playback_complete(self) -> bool:
         """Determine if playback should conclude."""
-        return self.loader_complete and self.buffer.available < self.config.block_size
+        return (
+            self.loader_complete 
+            and self.buffer.available < self.config.block_size
+        )
 
     def stop(self) -> None:
         """Immediately stop all playback and cleanup resources."""
+        logger.info("Stopping playback...")
+        
+        # Signal stop event for threads and callbacks
         self.stop_event.set()
+        
+        # Stop and close the audio stream safely
         if self.stream:
-            self.stream.abort()
-        self._buffer_thread.join(timeout=2)
-        logging.info("Playback stopped")
+            try:
+                self.stream.abort()
+            except Exception as e:
+                logger.error(f"Failed to abort stream: {str(e)}")
+
+        # Ensure the buffering thread terminates gracefully
+        if self._buffer_thread.is_alive():
+            self._buffer_thread.join(timeout=2)
 
 class PeakLimiter:
     """Prevents audio clipping through peak normalization."""
     def __init__(self, config: AudioConfig):
         self.threshold = config.limiter_threshold
+
+    def apply(self, data: np.ndarray) -> None:
+        """Apply gain reduction to prevent clipping."""
+        peak = np.max(np.abs(data))
+        if peak > self.threshold:
+            data *= self.threshold / peak
 
     def apply(self, data: np.ndarray) -> None:
         """Apply gain reduction to prevent clipping."""
