@@ -6,8 +6,9 @@ import time
 from typing import Optional
 
 import numpy as np
-from openai import audio
+from regex import P
 import sounddevice as sd
+import multiprocessing as mp
 
 from cm_settings import AudioConfig
 from cm_logging import setup_logger
@@ -23,6 +24,8 @@ class AtomicBuffer:
             (int(config.buffer_seconds * config.sample_rate), config.channels),
             dtype=np.float32
         )
+        # Keep track of the song index for each block
+        self.index_buffer = np.full(int(config.buffer_seconds * config.sample_rate / config.block_size), -1, dtype=np.int32)
         self.write_pos = 0  # Keep track the write and read location
         self.read_pos = 0
         self.capacity = len(self.buffer)  # Max data it can store in samples
@@ -30,7 +33,7 @@ class AtomicBuffer:
         self.lock = threading.RLock()  # Protects all read/write operations
         self.underrun_count = 0  # Counts how many times the buffer has to stop playback
 
-    def write(self, data: np.ndarray) -> int:
+    def write(self, data: np.ndarray, song_index: int) -> int:
         """Writes to the buffer"""
         with self.lock:
             write_size = min(len(data), self.capacity - self.available)
@@ -41,33 +44,42 @@ class AtomicBuffer:
             end = self.write_pos % self.capacity
             first_part = min(write_size, self.capacity - end)
             self.buffer[self.write_pos:end + first_part] = data[:first_part]  # Write to the end
+            self.index_buffer[(self.write_pos // self.config.block_size) % len(self.index_buffer)] = song_index
             
             if first_part < write_size:  # If wraps, continue writing from the start
                 self.buffer[:write_size - first_part] = data[first_part:write_size]
+                self.index_buffer[0] = song_index
             
             self.write_pos = (self.write_pos + write_size) % self.capacity  # Next location
             self.available += write_size  # Add size.
             return write_size
 
-    def read(self, requested: int) -> Optional[np.ndarray]:
+    def read(self, requested: int) -> Optional[tuple[np.ndarray, int]]:
         """Read from buffer"""
         with self.lock:
             if self.available < requested:
-                self.underrun_count += 1  # Count if not enough samples
-                logger.warning(f"Buffer underrun #{self.underrun_count}")
+                self.underrun_count += 1  # Avoid too many log entries
+                if self.underrun_count == 1:
+                    logger.warn(f"Buffer underrun - not enough processed audio")
                 return None  # Returns none to indicate underrun
             
+            # Identify buffer underrun resolution
+            if self.underrun_count > 0:
+                logger.info(f"Buffer ready ({self.underrun_count} underruns)")
+                self.underrun_count = 0
+
             end = self.read_pos % self.capacity  # Where the read will END.
             first_part = min(requested, self.capacity - end)  # Max Read in one part.
             result = np.empty((requested, self.config.channels), dtype=np.float32)
             result[:first_part] = self.buffer[self.read_pos:end + first_part]
+            song_index = self.index_buffer[(self.read_pos // self.config.block_size) % len(self.index_buffer)]
             
             if first_part < requested:  # If wraps, continue reading from start
                 result[first_part:] = self.buffer[:requested - first_part]
             
             self.read_pos = (self.read_pos + requested) % self.capacity  # Move read point
             self.available -= requested  # Decrement what was removed
-            return result  # Returns the result of the read
+            return result, song_index  # Returns the result of the read
 
     def clear(self):
         """Clear by resetting markers"""
@@ -88,6 +100,7 @@ class AudioPlayer:
         """Initialize audio player with shared processing queue."""
         self.config = config
         self.processed_clips_queue = processed_clips_queue
+        self.player_queue = None
         self.buffer = AtomicBuffer(config)
         self.stream: Optional[sd.OutputStream] = None
         self.stop_event = threading.Event()
@@ -100,9 +113,12 @@ class AudioPlayer:
         self.fade_duration = config.pause_fade
         self._peak_limiter = PeakLimiter(config)
         self._buffer_thread = threading.Thread(target=self._buffer_loop)
+        self.current_song_index = -1
+        self.song_list = []
 
-    def start(self, command_queue: queue.Queue) -> None:
+    def start(self, command_queue: queue.Queue, player_queue: queue.Queue) -> None:
         """Start audio playback system with command queue for IPC."""
+        self.player_queue = player_queue
         try:
             logger.info("Starting playback...")
             
@@ -137,6 +153,7 @@ class AudioPlayer:
 
                     if self.is_playback_complete():
                         logger.info("Playback complete")
+                        self.player_queue.put("complete")  # Notify main process
                         break
 
                     time.sleep(0.1)
@@ -153,15 +170,15 @@ class AudioPlayer:
 
         while not self.stop_event.is_set():
             try:
-                index, clip = self.processed_clips_queue.get(timeout=0.1)
-                if (index, clip) == (None, None):
+                index, title, clip = self.processed_clips_queue.get(timeout=0.1)
+                self.song_list.append(title)
+                if (index, title, clip) == (None, None, None):
                     self.loader_complete = True
                     logger.debug("Received loader completion signal")
                     break
                 
-                self._safe_buffer(clip)
+                self._safe_buffer(clip, index)
                 self.clips_buffered += 1
-                logger.debug("Buffered clip %d (Total: %d)", index, self.clips_buffered)
 
             except queue.Empty:
                 if self.loader_complete:
@@ -184,12 +201,12 @@ class AudioPlayer:
             self.buffer.available_seconds()
         )
 
-    def _safe_buffer(self, audio: np.ndarray) -> None:
+    def _safe_buffer(self, audio: np.ndarray, song_index: int) -> None:
         """Safely write audio data to buffer with flow control."""
         total_written = 0
         while total_written < len(audio) and not self.stop_event.is_set():
             chunk = audio[total_written : total_written + self.config.block_size]
-            written = self.buffer.write(chunk)
+            written = self.buffer.write(chunk, song_index)
             
             if written > 0:
                 total_written += written
@@ -206,11 +223,18 @@ class AudioPlayer:
             outdata.fill(0)
             return
         
-        data = self.buffer.read(frames)
+        result = self.buffer.read(frames)
         
-        if data is None:
+        if result is None:
             outdata.fill(0)
             return
+
+        data, song_index = result
+
+        # Check if the song index has changed
+        if song_index != self.current_song_index:
+            self.current_song_index = song_index
+            self.player_queue.put(f"playing:{song_index}_{self.song_list[song_index]}")
 
         # Apply volume adjustment (for pause fading)
         data *= self.current_volume

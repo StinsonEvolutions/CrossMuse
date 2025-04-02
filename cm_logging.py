@@ -1,6 +1,5 @@
 """Logging configuration module for CrossMuse application."""
 import logging
-import os
 from threading import Lock
 import multiprocessing as mp
 from typing import Dict
@@ -59,7 +58,7 @@ class LoggerManager:
         # Console Handler (Shared across all loggers, prints to stdout)
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
-        console_handler.setLevel(logging.DEBUG)  # Print all messages to console
+        console_handler.setLevel(level)
 
         # Create a logger
         logger = logging.getLogger(log_name)

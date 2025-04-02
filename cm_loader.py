@@ -1,6 +1,6 @@
 """Model: Song loading and processing module with multiprocessing support."""
-import logging
 import os
+from pathlib import Path
 import random
 import threading
 import unicodedata
@@ -49,7 +49,7 @@ class SongLoader:
                 self.executor.submit(self._process_song, song)
             self.executor.shutdown(wait=True)
         finally:
-            self.processed_clips.put((None, None))  # Termination sentinel
+            self.processed_clips.put((None, None, None))  # Termination sentinel
 
     def stop(self) -> None:
         """Signal all threads to stop processing."""
@@ -90,7 +90,7 @@ class SongLoader:
             # Update tracking state
             with self._lock:
                 self.previous_tail = clip[-fade_samples:]
-                self.processed_clips.put((song_index, processed_clip))
+                self.processed_clips.put((song_index, song['title'], processed_clip))
                 self.completed_count += 1
                 
         except Exception as e:
@@ -134,7 +134,7 @@ class SongLoader:
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '192',
+                'preferredquality': str(int(self.config.sample_rate / 1000)),
             }],
             'outtmpl': os.path.join(self.config.audio_dir, '%(title)s.%(ext)s'),
             'quiet': True,

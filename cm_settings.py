@@ -4,10 +4,15 @@ from typing import Dict, Any
 from pathlib import Path
 import platformdirs
 import os
+import sys
 
 @dataclass
 class AudioConfig:
-    CONFIG_VERSION = 2  # Current version
+    CONFIG_VERSION = 3  # New version for these changes
+	
+    playlist_songs: int = 20  # New config value
+    search_matches: int = 5    # New config value
+    search_delay: float = 0.5  # Seconds between keystroke and search
     
     version: int = CONFIG_VERSION
     pause_fade: float = 0.2
@@ -69,8 +74,15 @@ class AudioConfig:
             config_dict['playlists_dir'] = config_dict.get('playlists_dir', cls.playlists_dir)
             config_dict['recent_playlist'] = config_dict.pop('song_list', config_dict.get('recent_playlist', ''))  # Handle rename
             config_dict.pop('prebuffer_timeout', None)  # Remove if present, do nothing if not
+        
+        # Migration from v2 to v3
+        if version == 2:
+            config_dict['playlist_songs'] = 20
+            config_dict['search_matches'] = 5
+            config_dict['search_delay'] = 0.5
+            config_dict['version'] = cls.CONFIG_VERSION
 
-        # Set values to defaults for each of these specified keys, if loaded value is empty
+        # Set values to defaults for specified keys, if loaded value is empty
         if config_dict.get('audio_dir', '') == '':
             config_dict['audio_dir'] = cls.audio_dir
         if config_dict.get('playlists_dir', '') == '':
@@ -86,3 +98,13 @@ class AudioConfig:
             else:
                 raise AttributeError(f"AudioConfig has no attribute '{key}'")
         self._validate_config()
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+ 
+    return Path(os.path.join(base_path, relative_path))
