@@ -30,6 +30,7 @@ class MainDialog(tk.Toplevel):
         self.buffer_var = tk.IntVar(value=60)
         self.prefill_var = tk.IntVar(value=6)
         self.latency_var = tk.StringVar(value="high")
+        self.shuffle_var = tk.BooleanVar(value=config.shuffle)
 
         self._create_widgets()
         self._setup_validation()
@@ -104,7 +105,8 @@ class MainDialog(tk.Toplevel):
             "sample_rate": int(self.sample_rate_var.get()),
             "buffer_seconds": self.buffer_var.get(),
             "prefill_time": self.prefill_var.get(),
-            "latency": self.latency_var.get()
+            "latency": self.latency_var.get(),
+            "shuffle": self.shuffle_var.get()
         }
 
     def set_config(self, config: Dict[str, Any]):
@@ -118,6 +120,7 @@ class MainDialog(tk.Toplevel):
         self.buffer_var.set(config.get("buffer_seconds", 60))
         self.prefill_var.set(config.get("prefill_time", 6))
         self.latency_var.set(config.get("latency", "high"))
+        self.shuffle_var.set(config.get("shuffle", False))
 
         if self.playlists_dir_var.get():
             self.playlists_dir_lbl.config(text=self.playlists_dir_var.get())
@@ -213,7 +216,9 @@ class MainDialog(tk.Toplevel):
         )
         self.song_list_lbl = ttk.Label(self.basic_frame, text="No file selected")
         self.clip_entry = ttk.Entry(self.basic_frame, textvariable=self.clip_var, width=10)
-        self.fade_entry = ttk.Entry(self.basic_frame, textvariable=self.fade_var, width=10)    
+        self.fade_entry = ttk.Entry(self.basic_frame, textvariable=self.fade_var, width=10)
+        self.shuffle_label = ttk.Label(self.basic_frame, text="Shuffle")
+        self.shuffle_check = ttk.Checkbutton(self.basic_frame, variable=self.shuffle_var)
 
     def _create_advanced_settings_components(self):
         # Advanced Settings
@@ -307,12 +312,15 @@ class MainDialog(tk.Toplevel):
         ttk.Label(self.basic_frame, text="Playlist (JSON):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self.file_btn.grid(row=0, column=1, padx=5, pady=5)
         self.song_list_lbl.grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        
+    
         ttk.Label(self.basic_frame, text="Clip Length (seconds):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
         self.clip_entry.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-        
+    
         ttk.Label(self.basic_frame, text="Crossfade Duration (seconds):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
         self.fade_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+        self.shuffle_label.grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)  # Add shuffle label to layout
+        self.shuffle_check.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)  # Add shuffle checkbox to layout
 
         # --- Advanced Settings Layout ---
 
@@ -323,16 +331,16 @@ class MainDialog(tk.Toplevel):
         ttk.Label(self.advanced_frame, text="Songs Directory:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self.audio_dir_btn.grid(row=0, column=1, padx=5, pady=5)
         self.audio_dir_lbl.grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        
+    
         ttk.Label(self.advanced_frame, text="Sample Rate:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
         self.sample_rate_cb.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
-        
+    
         ttk.Label(self.advanced_frame, text="Buffer Size (seconds):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
         self.buffer_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
-        
+    
         ttk.Label(self.advanced_frame, text="Prefill Buffer (seconds):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
         self.prefill_entry.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
-        
+    
         ttk.Label(self.advanced_frame, text="Latency Mode:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
         self.latency_cb.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
 

@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import logging
@@ -110,9 +111,14 @@ class Controller:
                 with open(self.view.song_list_var.get()) as f:
                     songs = json.load(f)
     
+                # Shuffle the list of songs if shuffle is enabled
+                if config.shuffle:
+                    random.shuffle(songs)
+                    
                 logger.debug(f"Starting with config: {config}")
                 
-                self.processed_clips_queue = mp.Queue()
+                # Allow about 2x the buffer length in the queue
+                self.processed_clips_queue = mp.Queue(min(2 * config.buffer_seconds // config.clip_length, 2))
                 self.loader_process = mp.Process(
                     target=self._run_song_loader,
                     args=(songs, config.to_dict(), self.processed_clips_queue)
@@ -314,6 +320,7 @@ class Controller:
         self.view.buffer_var.set(config.buffer_seconds)
         self.view.prefill_var.set(config.prefill_time)
         self.view.latency_var.set(config.latency)
+        self.view.shuffle_var.set(config.shuffle)
         
         if Path(config.recent_playlist).exists():
             self.view.song_list_var.set(config.recent_playlist)
@@ -346,7 +353,8 @@ class Controller:
             prefill_time=self.view.prefill_var.get(),
             latency=self.view.latency_var.get(),
             clip_length=self.view.clip_var.get(),
-            fade_duration=self.view.fade_var.get()
+            fade_duration=self.view.fade_var.get(),
+            shuffle=self.view.shuffle_var.get()
         )
         
     def _open_log_file(self, event=None):
@@ -389,27 +397,35 @@ class Controller:
                 self._search_playlists(new_query, self.config.search_matches)
         
     def _search_playlists(self, query: str, max_results: int):
+        result:list[dict] = None
         try:
             result = self.ytmusic.search(query, filter='playlists', limit=max_results)
+        except Exception as e:
+            error_message = f"Search failed for query '{query}': {str(e)}"
+            logger.error(error_message)
+            self.view.after(0, lambda: self.view.update_status(
+                error_message, is_error=True
+            ))
+        
+        playlists = []
+        for i in range(len(result)):
+            entry = result[i]
+            if isinstance(entry.get('browseId'), str) and len(entry['browseId']) == 36 and entry['browseId'].startswith('VL'):
+                playlists.append({
+                    'index': i,
+				    'title': self._clean(entry['title']),
+				    'id': entry['browseId'][2:],
+                    'count': "..."
+			    })
+                logger.info(playlists[len(playlists) - 1])
+            else:
+                logger.error(f"Invalid playlist entry: {self._clean(entry['title'])} - {len(entry['browseId'])}")
             
-            playlists = []
-            for i in range(len(result)):
-                entry = result[i]
-                if isinstance(entry.get('browseId'), str) and len(entry['browseId']) > 2:
-                    playlists.append({
-                        'index': i,
-				        'title': self._clean(entry['title']),
-				        'id': entry['browseId'][2:],
-                        'count': "..."
-			        })
-                    logger.info(playlists[len(playlists) - 1])
-                else:
-                    logger.error(f"Invalid playlist entry: {entry}")
-            
-            # Update GUI on main thread
-            self.view.after(0, lambda: self._update_search_results(query, playlists))
+        # Update GUI on main thread
+        self.view.after(0, lambda: self._update_search_results(query, playlists))
 
-            for i in range(len(playlists)):
+        for i in range(len(playlists)):
+            try:
                 playlist = self.ytmusic.get_playlist(playlists[i]['id'], limit=None)
                 playlists[i].update({
                     'count': playlist.get('trackCount', 0),
@@ -425,13 +441,13 @@ class Controller:
                 if self.search_query != query:
                     break
                 self.view.after(0, lambda: self._update_search_results(query, playlists))
-            
-        except Exception as e:
-            error_message = f"Search failed: {str(e)}"
-            logger.error(error_message)
-            self.view.after(0, lambda: self.view.update_status(
-                error_message, is_error=True
-            ))
+
+            except Exception as e:
+                error_message = f"Unable to retrieve playlist details for {i}. {playlists[i]['title']} ({playlists[i]['id']}): {str(e)}"
+                logger.error(error_message)
+                self.view.after(0, lambda: self.view.update_status(
+                    error_message, is_error=True
+                ))
 
     def _clean(self, text: str):
         return text.encode("charmap", errors="ignore").decode("charmap")
@@ -490,18 +506,13 @@ class Controller:
         default_name = f"{clean_title}.json"
         default_path = Path(self.config.playlists_dir) / default_name
 
-        if default_path.exists():
-            if not self.view.ask_yes_no("Overwrite File", f"The file '{default_name}' already exists. Do you want to overwrite it?"):
-                return
-            path = str(default_path)
-        else:
-            path = self.view.ask_save_filename(
-                initialdir=self.config.playlists_dir,
-                initialfile=default_name,
-                filetypes=(("JSON files", "*.json"), ("All files", "*.*"))
-            )
-            if not path:
-                return
+        path = self.view.ask_save_filename(
+            initialdir=self.config.playlists_dir,
+            initialfile=default_name,
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*"))
+        )
+        if not path:
+            return
 
         try:
             with open(path, 'w') as f:

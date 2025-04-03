@@ -13,6 +13,7 @@ class AudioConfig:
     playlist_songs: int = 20  # New config value
     search_matches: int = 5    # New config value
     search_delay: float = 0.5  # Seconds between keystroke and search
+    shuffle: bool = False      # Shuffle song order before playing
     
     version: int = CONFIG_VERSION
     pause_fade: float = 0.2
@@ -80,6 +81,7 @@ class AudioConfig:
             config_dict['playlist_songs'] = 20
             config_dict['search_matches'] = 5
             config_dict['search_delay'] = 0.5
+            config_dict['shuffle'] = False  # Add default value for shuffle
             config_dict['version'] = cls.CONFIG_VERSION
 
         # Set values to defaults for specified keys, if loaded value is empty

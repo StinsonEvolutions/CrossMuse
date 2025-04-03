@@ -1,4 +1,5 @@
 """Model: Audio playback module with multiprocessing integration."""
+import gc
 import logging
 import queue
 import threading
@@ -9,19 +10,24 @@ import numpy as np
 from regex import P
 import sounddevice as sd
 import multiprocessing as mp
+import psutil
 
 from cm_settings import AudioConfig
 from cm_logging import setup_logger
 
-logger = setup_logger()
+logger = setup_logger(level=logging.DEBUG)
 
 class AtomicBuffer:
     """Thread-safe audio buffer using numpy"""
     def __init__(self, config: AudioConfig):
         """Initializes AtomicBuffer"""
         self.config = config
+        available_memory = psutil.virtual_memory().available
+        buffer_size = min(int(config.buffer_seconds * config.sample_rate), available_memory // 2)
+        buffer_size = (buffer_size // config.block_size) * config.block_size  # Ensure buffer size is a multiple of block size
+        logger.info(f"Allocating {buffer_size // config.sample_rate} second buffer")
         self.buffer = np.zeros(
-            (int(config.buffer_seconds * config.sample_rate), config.channels),
+            (buffer_size, config.channels),
             dtype=np.float32
         )
         # Keep track of the song index for each block
@@ -38,48 +44,48 @@ class AtomicBuffer:
         with self.lock:
             write_size = min(len(data), self.capacity - self.available)
             if write_size == 0:
-                # Protects from errors where write process calls
                 return 0  # Buffer is full
 
             end = self.write_pos % self.capacity
             first_part = min(write_size, self.capacity - end)
-            self.buffer[self.write_pos:end + first_part] = data[:first_part]  # Write to the end
+            self.buffer[self.write_pos:end + first_part] = data[:first_part]
             self.index_buffer[(self.write_pos // self.config.block_size) % len(self.index_buffer)] = song_index
-            
-            if first_part < write_size:  # If wraps, continue writing from the start
+        
+            if first_part < write_size:
                 self.buffer[:write_size - first_part] = data[first_part:write_size]
                 self.index_buffer[0] = song_index
-            
-            self.write_pos = (self.write_pos + write_size) % self.capacity  # Next location
-            self.available += write_size  # Add size.
+        
+            self.write_pos = (self.write_pos + write_size) % self.capacity
+            self.available += write_size
             return write_size
 
     def read(self, requested: int) -> Optional[tuple[np.ndarray, int]]:
         """Read from buffer"""
         with self.lock:
             if self.available < requested:
-                self.underrun_count += 1  # Avoid too many log entries
+                self.underrun_count += 1
                 if self.underrun_count == 1:
                     logger.warn(f"Buffer underrun - not enough processed audio")
-                return None  # Returns none to indicate underrun
-            
-            # Identify buffer underrun resolution
+                return None
+        
             if self.underrun_count > 0:
                 logger.info(f"Buffer ready ({self.underrun_count} underruns)")
                 self.underrun_count = 0
 
-            end = self.read_pos % self.capacity  # Where the read will END.
-            first_part = min(requested, self.capacity - end)  # Max Read in one part.
+            end = self.read_pos % self.capacity
+            first_part = min(requested, self.capacity - end)
             result = np.empty((requested, self.config.channels), dtype=np.float32)
             result[:first_part] = self.buffer[self.read_pos:end + first_part]
             song_index = self.index_buffer[(self.read_pos // self.config.block_size) % len(self.index_buffer)]
-            
-            if first_part < requested:  # If wraps, continue reading from start
+        
+            if first_part < requested:
                 result[first_part:] = self.buffer[:requested - first_part]
-            
-            self.read_pos = (self.read_pos + requested) % self.capacity  # Move read point
-            self.available -= requested  # Decrement what was removed
-            return result, song_index  # Returns the result of the read
+        
+            self.read_pos = (self.read_pos + requested) % self.capacity
+            self.available -= requested
+            return result, song_index
+
+
 
     def clear(self):
         """Clear by resetting markers"""
@@ -114,7 +120,7 @@ class AudioPlayer:
         self._peak_limiter = PeakLimiter(config)
         self._buffer_thread = threading.Thread(target=self._buffer_loop)
         self.current_song_index = -1
-        self.song_list = []
+        self.song_list = {}
 
     def start(self, command_queue: queue.Queue, player_queue: queue.Queue) -> None:
         """Start audio playback system with command queue for IPC."""
@@ -171,7 +177,7 @@ class AudioPlayer:
         while not self.stop_event.is_set():
             try:
                 index, title, clip = self.processed_clips_queue.get(timeout=0.1)
-                self.song_list.append(title)
+                self.song_list[index] = title
                 if (index, title, clip) == (None, None, None):
                     self.loader_complete = True
                     logger.debug("Received loader completion signal")
@@ -180,9 +186,14 @@ class AudioPlayer:
                 self._safe_buffer(clip, index)
                 self.clips_buffered += 1
 
+                # Trigger garbage collection if memory usage is high
+                if psutil.virtual_memory().percent > 80:
+                    gc.collect()
+
             except queue.Empty:
-                if self.loader_complete:
-                    break  # Normal termination case
+                # Might just be slow processing - wait for more clips
+                logger.debug("No clips available, waiting...")
+                time.sleep(0.1)
             
             # Check prefill status
             if not self.prefill_complete.is_set():
@@ -234,7 +245,8 @@ class AudioPlayer:
         # Check if the song index has changed
         if song_index != self.current_song_index:
             self.current_song_index = song_index
-            self.player_queue.put(f"playing:{song_index}_{self.song_list[song_index]}")
+            title = self.song_list.pop(song_index, "[Unknown]")
+            self.player_queue.put(f"playing:{song_index}_{title}")
 
         # Apply volume adjustment (for pause fading)
         data *= self.current_volume

@@ -9,7 +9,7 @@ class LoggerManager:
     _default_log = "crossmuse"
     _instance = None
     _lock = Lock()
-    _loggers: Dict[str, logging.Logger] = {}
+    _loggers: Dict[tuple, logging.Logger] = {}
 
     def __new__(cls):
         with cls._lock:
@@ -30,10 +30,11 @@ class LoggerManager:
             logging.Logger: The configured logger.
         """
         with cls._lock:
-            if log_name not in cls._loggers:
+            key = (log_name, level)
+            if key not in cls._loggers:
                 logger = cls._create_logger(log_name, level)
-                cls._loggers[log_name] = logger
-            return cls._loggers[log_name]
+                cls._loggers[key] = logger
+            return cls._loggers[key]
 
     @staticmethod
     def _create_logger(log_name: str, level: int) -> logging.Logger:
@@ -61,7 +62,7 @@ class LoggerManager:
         console_handler.setLevel(level)
 
         # Create a logger
-        logger = logging.getLogger(log_name)
+        logger = logging.getLogger(f"{log_name}_{level}")
         logger.setLevel(logging.DEBUG)  # Capture all logs, handlers will filter as needed
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
