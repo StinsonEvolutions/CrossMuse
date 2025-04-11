@@ -1,13 +1,17 @@
 """Model: Song loading and processing module with multiprocessing support."""
+import json
 import os
 from pathlib import Path
 import random
 import threading
+import time
 import unicodedata
 import re
 import multiprocessing as mp
+import queue
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Deque
+from collections import deque
 
 import numpy as np
 import yt_dlp
@@ -24,86 +28,295 @@ class SongLoader:
         """Initialize song loader with output directory and results queue."""
         self.config = config
         self.processed_clips = processed_clips_queue
+        self.loader_queue = None
         self.songs: List[Dict] = []
-        self.executor = ThreadPoolExecutor(max_workers=4)
-        self.ready_events: Dict[int, threading.Event] = {}
+        self.max_workers = min(4, processed_clips_queue._maxsize)
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self.previous_tail: Optional[np.ndarray] = None
-        self.completed_count = 0
-        self._lock = threading.Lock()
-        self.stop_event = threading.Event()
+        self.complete_event = threading.Event()
+        self.repeat_mode = config.repeat
+        self.shuffle_mode = config.shuffle
+        
+        # Processing queue and related variables
+        self.processing_queue = deque()  # Queue of songs to process
+        self.queue_lock = threading.Lock()  # Lock for thread-safe queue access
+        self.queue_not_empty = threading.Condition(self.queue_lock)  # Condition for queue not empty
+        self.current_buffer_seconds = 0  # Current audio content length in seconds
+        self.processed_songs = set()  # Set of processed song IDs
+        self.last_song = None   # Last song processed
+        self.last_cycle_songs = []  # Track the last N songs from previous cycle
+        self.history_buffer_size = 0  # Will be set in start_processing
+        self.worker_threads = []  # List of worker threads
+        self.current_cycle = 0  # Current playlist cycle
+        self.ready_events: Dict[str, threading.Event] = {}
+    
+        # Track clip lengths for processed_clips queue
+        self.clip_lengths = deque()  # Store lengths of clips in the processed_clips queue
+        self.clip_lengths_lock = threading.Lock()  # Lock for thread-safe access to clip_lengths
 
     def add_songs(self, songs: List[Dict]) -> None:
         """Add songs to the processing queue with tracking indices."""
-        with self._lock:
-            for song in songs:
-                song['index'] = len(self.songs)
-                self.songs.append(song)
-                self.ready_events[song['index']] = threading.Event()
+        # Store original songs list
+        for i, song in enumerate(songs):
+            self.ready_events[song['id']] = threading.Event()
+            self.songs.append(song)
 
-    def start_processing(self) -> None:
-        """Start parallel processing of all songs in added order."""
+    def start_processing(self, loader_queue: mp.Queue) -> None:
+        """Start continuous processing of songs with smart queue management."""
+        self.loader_queue = loader_queue
+    
+        # Set history buffer size based on playlist length
+        self.history_buffer_size = len(self.songs) // 3
+        logger.info(f"Set history buffer size to {self.history_buffer_size}")
+    
+        logger.info(f"Starting song processing with repeat={self.repeat_mode}, shuffle={self.shuffle_mode}")
+    
         try:
-            for song in self.songs:
-                if self.stop_event.is_set():
-                    break
-                self.executor.submit(self._process_song, song)
-            self.executor.shutdown(wait=True)
-        finally:
-            self.processed_clips.put((None, None, None))  # Termination sentinel
-
-    def stop(self) -> None:
-        """Signal all threads to stop processing."""
-        self.stop_event.set()
-        self.executor.shutdown(wait=False)
-
-    def _process_song(self, song: Dict) -> None:
-        """Process individual song through download, processing, and clip generation."""
-        if self.stop_event.is_set():
-            return
-
-        song_index = song['index']
-        logger.info("Processing song: %s", song['title'])
-        
-        try:
-            file_path = self._download_song(song)
-            audio = self._load_and_process(file_path)
+            # Start worker threads
+            for i in range(self.max_workers):
+                thread = threading.Thread(
+                    target=self._worker_thread_func,
+                    args=(i,),
+                    daemon=True
+                )
+                self.worker_threads.append(thread)
+                thread.start()
             
+            # Initial population of the queue and ongoing monitoring
+            self._queue_monitor_thread()
+            
+        finally:
+            # Wait for worker threads to finish
+            for thread in self.worker_threads:
+                thread.join(timeout=2)
+            
+            # Send termination sentinel
+            self.processed_clips.put((None, None, None))
+            logger.info("Song processing completed")
+
+    def _queue_monitor_thread(self):
+        """Monitor the processing queue and add more songs as needed."""
+        while not self.complete_event.is_set():               
+            with self.queue_lock:
+                # Check the total length of clips in the queue
+                queue_length_seconds = self._queue_clips_length()
+
+                # Then check if we need to add more songs to the queue
+                if (queue_length_seconds < self.config.buffer_seconds):
+                    
+                    if len(self.processed_songs) >= len(self.songs):
+                        # If repeat enabled, reset cycle
+                        if self.repeat_mode:
+                            self._prepare_next_cycle()
+                    
+                    # Add more songs if available and queue not full
+                    self._add_songs_to_queue()
+            
+                    # Notify worker threads that the queue is not empty
+                    self.queue_not_empty.notify_all()
+    
+            # Sleep to avoid busy waiting
+            time.sleep(0.5)
+
+    def _prepare_next_cycle(self):
+        """Prepare for the next playlist cycle."""
+        logger.info(f"Preparing for cycle {self.current_cycle + 1}")
+        
+        # Get the most recent songs from both the processing queue and processed songs
+        recent_songs = []
+    
+        # First, get songs from the processing queue (these are the most recent)
+        queue_songs = [item[0]['id'] for item in self.processing_queue]
+        recent_songs.extend(queue_songs)
+    
+        # If we need more songs to reach history_buffer_size, get them from processed_songs
+        if len(recent_songs) < self.history_buffer_size:
+            # Convert processed_songs to a list and get the most recent ones
+            processed_list = list(self.processed_songs)
+            # Get the remaining number of songs needed from the end of processed_songs
+            remaining_needed = self.history_buffer_size - len(recent_songs)
+            recent_from_processed = processed_list[-remaining_needed:]
+            recent_songs.extend(recent_from_processed)
+    
+        # Trim to history_buffer_size if we have more
+        self.last_cycle_songs = recent_songs[-self.history_buffer_size:]
+        
+        # Reset processed songs for the new cycle
+        self.processed_songs.clear()
+        
+        # Increment cycle counter
+        self.current_cycle += 1
+        
+        logger.info(f"Starting cycle {self.current_cycle}")
+
+    def _add_songs_to_queue(self):
+        """Add more songs to the processing queue using smart selection."""
+        # Get songs that haven't been processed in this cycle
+        unprocessed_songs = [
+            song.copy() for song in self.songs 
+            if song['id'] not in self.processed_songs and all(item[0]['id'] != song['id'] for item in self.processing_queue)
+        ]
+    
+        if not unprocessed_songs:
+            return
+        
+        # Apply smart shuffle if enabled
+        if self.shuffle_mode:
+            # Split into recent and other songs
+            recent_songs = [
+                song for song in unprocessed_songs 
+                if song['id'] in self.last_cycle_songs
+            ]
+            other_songs = [
+                song for song in unprocessed_songs 
+                if song['id'] not in self.last_cycle_songs
+            ]
+        
+            # Shuffle both parts
+            random.shuffle(recent_songs)
+            random.shuffle(other_songs)
+        
+            # Combine with recent songs at the end to avoid back-to-back repeats
+            unprocessed_songs = other_songs + recent_songs
+    
+        # Add songs to the queue, up to a reasonable limit
+        songs_to_add = min(self.max_workers * 2, len(unprocessed_songs))
+
+        for i in range(songs_to_add):
+            logger.info(f"Adding song {unprocessed_songs[i]['id']} to queue")
+            self._add_song_to_queue(unprocessed_songs[i], i == len(unprocessed_songs) - 1)
+            
+        logger.info(f"Added {songs_to_add} songs to processing queue")
+
+    def _add_song_to_queue(self, song: Dict, is_final_song: bool = False):
+        """Add a song to the processing queue, updating tracking values accordingly"""
+        # Set the previous song ID and update the last song
+        logger.info(f"prevId: {song.get('prevId', 'none')}, last_song: {self.last_song}, id: {song['id']}")
+        song['prevId'] = self.last_song
+        self.last_song = song['id']
+
+        # Add the song to the queue with the final song flag
+        self.processing_queue.append((song, is_final_song))
+    
+        # Update the current buffer seconds
+        song_duration = song.get('duration', self.config.clip_length)
+        self.current_buffer_seconds += min(
+            song_duration, 
+            self.config.clip_length if self.config.clip_length > 0 else song_duration
+        )
+
+    def _queue_clips_length(self) -> float:
+        """Return the total length of audio clips in the processed_clips queue in seconds."""
+        with self.clip_lengths_lock:
+            # Check if we need to sync our tracking with the actual queue size
+            queue_size = self.processed_clips.qsize()
+        
+            # If our tracking has more items than the queue, remove items from the start
+            # This happens when the player process has consumed items from the queue
+            while len(self.clip_lengths) > queue_size:
+                self.clip_lengths.popleft()
+            
+            # Return the sum of all tracked clip lengths
+            return sum(self.clip_lengths)
+    
+    def _worker_thread_func(self, worker_id):
+        """Worker thread function to process songs from the queue."""
+        logger.info(f"Worker {worker_id} started")
+    
+        while not self.complete_event.is_set() or len(self.processing_queue) > 0:
+            # Get the next song from the queue
+            song = None
+            is_final_song = False
+
+            with self.queue_lock:
+                
+                if len(self.processing_queue) == 0:
+                    # Wait for the queue to have items
+                    self.queue_not_empty.wait(timeout=1.0)
+
+                if len(self.processing_queue) > 0:
+                    song, is_final_song = self.processing_queue.popleft()
+                    self.processed_songs.add(song['id'])  # Mark the song as processed
+        
+            if song:
+                try:
+                    # Process the song
+                    success = self._process_song(song, is_final_song)
+                
+                    if success:
+                        self.ready_events[song['id']].set()  # Indicate that this song is ready
+                        logger.info(f"Worker {worker_id} processed song {song['title']}")
+                
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error processing song: {str(e)}")
+
+                finally:
+                    if is_final_song and not self.repeat_mode:
+                        self.complete_event.set()
+        
+            # Small sleep to prevent CPU thrashing
+            time.sleep(0.1)
+    
+        logger.info(f"Worker {worker_id} stopped")
+    
+    def _process_song(self, song: Dict, is_final_song: bool) -> bool:
+        """Process a single song - download, process, and send to player."""
+        song_id = song['id']
+        
+        logger.info(f"Processing song {song_id}. {song['title']} (id: {song_id})")
+    
+        try:
+            # Download the song
+            file_path = self._download_song(song)
+            logger.info(f"Downloaded {song['title']} to path {file_path}")
+            
+            # Load and process the audio
+            audio = self._load_and_process(file_path)
+        
             # Calculate timing parameters
             clip_length = self.config.clip_length
             if self.config.clip_length == 0 or self.config.clip_length > len(audio) / self.config.sample_rate:
                 clip_length = len(audio) / self.config.sample_rate
+            
+            logger.info(f"Processed {song['title']} with clip length {clip_length}")
 
             clip_samples = int(clip_length * self.config.sample_rate)
             fade_samples = int(min(self.config.fade_duration, clip_length / 2) * self.config.sample_rate)
+        
+            # Apply fades to the clip
+            self._apply_fades(audio, fade_samples)
             
-            # Generate random clip with fades
-            clip = self._generate_clip(audio, song_index, clip_samples)
-            self._apply_fades(clip, fade_samples)
+            logger.info(f"Applied fades to {song['title']}")
             
-            # Ensure previous song in order has been processed before continuing
-            if song_index > 0:
-                self.ready_events[song_index-1].wait()
-                
-            # Handle crossfade composition + start fade in / end fade out
-            processed_clip = self._apply_crossfade(song_index, clip, fade_samples)
-            
-            # Update tracking state
-            with self._lock:
-                self.previous_tail = clip[-fade_samples:]
-                self.processed_clips.put((song_index, song['title'], processed_clip))
-                self.completed_count += 1
-                
-        except Exception as e:
-            logger.error("Failed to process %s: %s", song.get('title'), str(e))
-        finally:
-            self.ready_events[song_index].set()
+            # Wait until previous song has been processed
+            if song['prevId'] is not None:
+                self.ready_events[song['prevId']].wait()
+                self.ready_events[song['prevId']].clear()
 
-    def _generate_clip(self, audio: np.ndarray, song_index: int, clip_samples: int) -> np.ndarray:
-        """Generate random audio clip"""
-        max_start = len(audio) - clip_samples
-        clip_buffer = int(0.2 * max_start)
-        start = random.randint(clip_buffer, max_start - clip_buffer)
-        return audio[start:start + clip_samples]
+            processed_clip = self._apply_crossfade(song_id, audio, fade_samples, is_final_song)
+            # Store the tail for the next song
+            self.previous_tail = audio[-fade_samples:]
+            
+            logger.info(f"Applied crossfades to {song['title']}")
+    
+            # Track the clip length (in seconds)
+            clip_length_seconds = len(processed_clip) / self.config.sample_rate
+            with self.clip_lengths_lock:
+                self.clip_lengths.append(clip_length_seconds)
+        
+            # Send to player
+            self.processed_clips.put((song_id, song['title'], processed_clip))
+            logger.info(f"Sent processed clip for {song['title']} with length {len(processed_clip)}")
+        
+            # Notify when the final song has been processed
+            if is_final_song and not self.repeat_mode:
+                self.loader_queue.put("loader:complete")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to process {song['title']}: {str(e)}")
+            return False
 
     def _apply_fades(self, clip: np.ndarray, fade_samples: int) -> None:
         """Apply fade in and fade out to the clip"""
@@ -112,23 +325,39 @@ class SongLoader:
         clip[:fade_samples] *= fade_in
         clip[-fade_samples:] *= fade_out
 
-    def _apply_crossfade(self, song_index: int, clip: np.ndarray, fade_samples: int) -> np.ndarray:
+    def _apply_crossfade(self, song_id: str, clip: np.ndarray, fade_samples: int, is_final_song: bool = False) -> np.ndarray:
         """Apply appropriate fade-in/crossfade based on song position."""
-        if song_index == 0:
-            processed_clip = clip[:-fade_samples]  # Take Clip before fade out
+        # If this is the first song ever processed and we have no previous tail
+        if self.previous_tail is None:
+            # For the first song, we should include the full clip if it's also the final song
+            if is_final_song:
+                processed_clip = clip
+            else:
+                processed_clip = clip[:-fade_samples]
+        # Otherwise, apply crossfade with previous tail
         else:
-            if self.previous_tail is None:
-                raise ValueError("Missing previous song tail for crossfade")
             crossfade = self.previous_tail + clip[:fade_samples]
-            processed_clip = np.concatenate([crossfade, clip[fade_samples:-fade_samples]])
-        
-        if song_index == len(self.songs) - 1:  # If end Song, concatenate current tail for fadeout
-            processed_clip = np.concatenate([processed_clip, clip[-fade_samples:]])
-        logger.debug(f"Song {song_index} processed - {len(processed_clip)} samples")
+            # For the final song, include the fade out portion
+            if is_final_song and not self.repeat_mode:
+                processed_clip = np.concatenate([crossfade, clip[fade_samples:]])
+            else:
+                processed_clip = np.concatenate([crossfade, clip[fade_samples:-fade_samples]])
+            
+        logger.debug(f"Song {song_id} processed - {len(processed_clip)} samples")
         return processed_clip
+
 
     def _download_song(self, song: Dict) -> str:
         """Downloads the song from YouTube using yt_dlp"""
+        clip_length = self.config.clip_length
+        song_id = song['id']
+        song_url = f"{AudioConfig.YOUTUBE_MUSIC_VIDEO_URL_PREFIX}{song_id}"
+
+        def progress_hook(progress):
+            if progress['status'] in ['downloading', 'finished']:
+                percent = progress['_percent']
+                self.loader_queue.put(f"download:{song['id']}:{percent:.0f}")
+
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -138,21 +367,28 @@ class SongLoader:
             }],
             'outtmpl': os.path.join(self.config.audio_dir, '%(title)s.%(ext)s'),
             'quiet': True,
+            'progress_hooks': [progress_hook],
+            'force_download': True
         }
+        if clip_length > 0:
+            start_time = random.randint(0, max(0, int(song['duration']) - clip_length))
+            end_time = start_time + clip_length
+            ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func([], [[start_time, end_time]])
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(song['url'], download=False)
+            logger.info(f"Downloading {song['title']}...")
+            info = ydl.extract_info(song_url, download=False)
             base_filepath = ydl.prepare_filename(info).rsplit('.', 1)[0]
             base_filename = os.path.basename(base_filepath)
             base_filepath += ".mp3"
-    
-            desired_filepath = os.path.join(self.config.audio_dir, f"{self.sanitize_filename(base_filename)}.mp3")
+            desired_filepath = os.path.join(self.config.audio_dir, f"{self.sanitize_filename(base_filename)}_{song_id}.mp3")
 
-            if not os.path.exists(desired_filepath):
-                logger.info(f"Downloading: {song['title']}")
-                ydl.download([song['url']])
-                os.rename(base_filepath, desired_filepath)
-                
+            # Note: only downloading clip, so download and overwrite every time
+            self.loader_queue.put(f"download:{song['id']}:0")
+            ydl.download([song_url])
+            logger.info(f"Downloaded {song['title']}")
+            os.replace(base_filepath, desired_filepath)
+
             return desired_filepath
 
     def sanitize_filename(self, filename: str) -> str:
@@ -168,6 +404,11 @@ class SongLoader:
         ).set_frame_rate(
             self.config.sample_rate
         ).apply_gain(self.config.volume_adjustment)
+    
+        # Ensure the audio segment is limited to the clip length
+        if self.config.clip_length > 0:
+            clip_length_ms = self.config.clip_length * 1000  # Convert to milliseconds
+            audio = audio[:clip_length_ms]
         
         samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
         return (samples / np.iinfo(np.int16).max).reshape(-1, self.config.channels)

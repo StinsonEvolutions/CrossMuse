@@ -8,6 +8,7 @@ import logging
 import threading
 import multiprocessing as mp
 from pathlib import Path
+import time
 from typing import Dict, Any, Optional
 
 import yt_dlp
@@ -18,7 +19,7 @@ from cm_settings import AudioConfig
 from cm_logging import setup_logger
 from cm_settings import resource_path
 
-logger = setup_logger(level=logging.DEBUG)
+logger = setup_logger()
 
 class Controller:
     def __init__(self, root):
@@ -27,16 +28,12 @@ class Controller:
 
         self.view = MainDialog(root, self.config)
         self.view.protocol("WM_DELETE_WINDOW", self._exit)
-        
-        self.playback_active = False
-        self.paused = False
-        self.processed_clips_queue: Optional[mp.Queue] = None
-        self.loader_process: Optional[mp.Process] = None
-        self.player_process: Optional[mp.Process] = None
-        self.command_queue: mp.Queue = mp.Queue()
-        self.player_queue: mp.Queue = mp.Queue()
+
+        # Initialize playback-related attributes
+        self.songs_status = {}  # Dict to store songs with their statuses
+        self._reset_playback()
 		
-        # Add new search-related attributes
+        # Add search-related attributes
         self.search_query = ""
         self.current_playlist = None
         self.last_search_time = 0
@@ -54,7 +51,7 @@ class Controller:
         self.view.set_command(self.view.load_btn, self._load_playlist)
         self.view.set_command(self.view.start_btn, self._start_playback)
         self.view.set_command(self.view.pause_btn, self._toggle_pause)
-        self.view.set_command(self.view.stop_btn, self._stop_playback)
+        self.view.set_command(self.view.stop_btn, self._stop)
         self.view.set_command(self.view.file_btn, lambda: self._select_song_list(self.view.song_list_var, self.view.song_list_lbl))
         self.view.set_command(self.view.audio_dir_btn, lambda: self._select_audio_dir(self.view.audio_dir_var, self.view.audio_dir_lbl))
         self.view.song_list_var.trace_add("write", lambda *_: self.view.update_playback_button_states(self.playback_active, self.paused))
@@ -97,34 +94,40 @@ class Controller:
         """Handle playback start/resume."""
         if not self.playback_active:
             try:
+                # Clear the log file before starting playback
+                self._clear_log_file()
+
                 config = self._save_config()
                 audio_path = Path(self.view.audio_dir_var.get())
                 if not audio_path.is_absolute():
                     audio_path = Path(self.view.audio_dir_var.get()) / audio_path
                 os.makedirs(audio_path, exist_ok=True)
-                
+            
                 playlist_path = Path(self.view.playlists_dir_var.get())
                 if not playlist_path.is_absolute():
                     playlist_path = Path(self.view.playlists_dir_var.get()) / playlist_path
                 os.makedirs(playlist_path, exist_ok=True)
+            
+                # Load and potentially upgrade the playlist
+                songs = self._load_and_upgrade_playlist(self.view.song_list_var.get())
                 
-                with open(self.view.song_list_var.get()) as f:
-                    songs = json.load(f)
-    
-                # Shuffle the list of songs if shuffle is enabled
-                if config.shuffle:
-                    random.shuffle(songs)
-                    
                 logger.debug(f"Starting with config: {config}")
-                
-                # Allow about 2x the buffer length in the queue
-                self.processed_clips_queue = mp.Queue(min(2 * config.buffer_seconds // config.clip_length, 2))
+            
+                # Initialize songs_status list
+                for song in songs:
+                    self.songs_status[song['id']] = {'song': song, 'downloaded': False, 'buffered': False, 'played': False}
+            
+                # Limit the processing queue to a reasonable size - either 4 or the number of songs, whichever is smaller
+                queue_size = min(4, len(songs))
+                self.processed_clips_queue = mp.Queue(queue_size)
+                logger.info(f"Initialized song queue to hold up to {queue_size} songs")
+
                 self.loader_process = mp.Process(
                     target=self._run_song_loader,
-                    args=(songs, config.to_dict(), self.processed_clips_queue)
+                    args=(songs, config.to_dict(), self.processed_clips_queue, self.loader_queue)
                 )
                 self.loader_process.start()
-                
+            
                 self.command_queue = mp.Queue()
                 self.player_process = mp.Process(
                     target=self._run_audio_player,
@@ -132,21 +135,24 @@ class Controller:
                 )
                 self.player_process.start()
                 self.playback_active = True
-                self.view.after(100, self._process_player_status)
+
+                # Start the playback manager thread
+                self.playback_manager_thread = threading.Thread(target=self._playback_manager, daemon=True)
+                self.playback_manager_thread.start()
 
             except Exception as e:
                 logger.error(f"Failed to start playback: {str(e)}")
                 self.view.show_error("Playback Error", f"Failed to start playback: {str(e)}")
-        
+    
         self.view.update_playback_button_states(self.playback_active, self.paused)
 
     @staticmethod
-    def _run_song_loader(songs: list, config: Dict[str, Any], queue: mp.Queue) -> None:
+    def _run_song_loader(songs: list, config: Dict[str, Any], queue: mp.Queue, loader_queue: mp.Queue) -> None:
         """Runs song loading in a dedicated process."""
         from cm_loader import SongLoader
         loader = SongLoader(AudioConfig.from_dict(config), queue)
         loader.add_songs(songs)
-        loader.start_processing()
+        loader.start_processing(loader_queue)
 
     @staticmethod
     def _run_audio_player(config: Dict[str, Any], in_queue: mp.Queue, cmd_queue: mp.Queue, player_queue: mp.Queue) -> None:
@@ -155,26 +161,73 @@ class Controller:
         player = AudioPlayer(AudioConfig.from_dict(config), in_queue)
         player.start(cmd_queue, player_queue)
 
-    def _process_player_status(self):
-        if self.playback_active and not self.player_process.is_alive():
-            logger.info("Player process has terminated")
-            self._stop_playback()
-        elif self.playback_active:
-            self._process_player_messages()  # Call the new method to process player messages
-            self.view.after(100, self._process_player_status)
+    def _playback_manager(self):
+        """Manage playback by processing messages from both loader_queue and player_queue."""
+        while self.playback_active:
+            self._process_loader_messages()
+            self._process_player_messages()
+            time.sleep(0.1)
+
+    def _process_loader_messages(self):
+        """Process messages from the loader queue."""
+        while not self.loader_queue.empty():
+            try:
+                message = self.loader_queue.get_nowait()
+                if message.startswith("download:"):
+                    _, song_id, percent_downloaded = message.split(":")
+                    song_id, percent_downloaded = str(song_id), float(percent_downloaded)
+                    # Only show downloading messages if the last status message was not a playing message
+                    if self.last_status_message != "playing":
+                        self.view.update_status(f"Downloading {self.songs_status[song_id]['song']['title']}... {percent_downloaded}%")
+                    if percent_downloaded > 99:
+                        self.songs_status[song_id]['downloaded'] = True
+                elif message == "loader:complete":
+                    # All songs have been processed, force playback to start if needed
+                    logger.info("Received loader completion notification, forcing playback to start if needed")
+                    self.command_queue.put("FORCE_START")
+                    self.view.update_status("All songs processed, starting playback")
+
+            except queue.Empty:
+                break
 
     def _process_player_messages(self):
         """Process messages from the player queue."""
         while not self.player_queue.empty():
             try:
                 message = self.player_queue.get_nowait()
-                if message == "complete":
+
+                if message == "playback:complete":
                     self.view.update_status("Playback complete")
-                    self._stop_playback()
+                    if self.current_song['id'] is not None:  # Check if we have a valid current song
+                        self.songs_status[self.current_song['id']]['played'] = True
+                    
+                    # The loader will continuously feed songs in repeat mode
+                    if not self.config.repeat:
+                        self._stop()
+                    else:
+                        # Just update the status to indicate we're continuing in repeat mode
+                        self.view.update_status("Continuing playback (repeat mode)")
+
+                elif message.startswith("buffering:"):
+                    _, song_id, percent_buffered = message.split(":", 2)
+                    song_id, percent_buffered = str(song_id), float(percent_buffered)
+                    self.view.update_status(f"Buffering... {percent_buffered}%")
+                    if percent_buffered >= 99:
+                        self.view.update_status("Buffering complete")
+                        self.songs_status[song_id]['buffered'] = True
+                        # If a song was already playing (ie. buffering to catch up), show playing message again
+                        if self.current_song['id'] is not None:
+                            self.view.update_status(f"Playing {self.songs_status[self.current_song['id']]['song']['index'] + 1}. {self.current_song['title']}")
+                            self.last_status_message = "playing"
+
                 elif message.startswith("playing:"):
-                    index, title = message[len("playing:"):].split("_", 1)
-                    self.current_song_title = title
-                    self.view.update_status(f"Playing {int(index)+1}. {self.current_song_title}")
+                    _, song_id, title = message.split(":", 2)
+                    if self.current_song['id'] is not None:
+                        self.songs_status[self.current_song['id']]['played'] = True
+                    self.current_song = {'id': song_id, 'title': title}
+                    self.view.update_status(f"Playing {self.songs_status[self.current_song['id']]['song']['index'] + 1}. {self.current_song['title']}")
+                    self.last_status_message = "playing"
+
             except queue.Empty:
                 break
 
@@ -188,7 +241,7 @@ class Controller:
             self.paused = not self.paused
             self.view.update_playback_button_states(self.playback_active, self.paused)
             
-    def _stop_playback(self):
+    def _stop(self):
         logger.info("Shutting down...")
         if self.playback_active:
             self.command_queue.put("STOP")
@@ -206,15 +259,27 @@ class Controller:
                 self.player_process.terminate()
         
         logger.info("Application shutdown complete")
+        self._reset_playback()
+
+    def _reset_playback(self):
         self.playback_active = False
         self.paused = False
-        self.loader_process = None
-        self.player_process = None
+        self.processed_clips_queue: Optional[mp.Queue] = None
+        self.loader_process: Optional[mp.Process] = None
+        self.player_process: Optional[mp.Process] = None
+        self.command_queue: mp.Queue = mp.Queue()
+        self.player_queue: mp.Queue = mp.Queue()
+        self.loader_queue: mp.Queue = mp.Queue()
+        self.playback_manager_thread = None
+        self.current_song = {'id': None, 'title': None}
+        self.last_status_message = None  # Track the last status message type
+
+        self.view.update_status("")
         self.view.update_playback_button_states(self.playback_active, self.paused)
         self.view.set_settings_enabled(True)
 
     def _exit(self):
-        self._stop_playback()
+        self._stop()
         self.view.root.quit()
         self.view.root.destroy()
 
@@ -321,6 +386,7 @@ class Controller:
         self.view.prefill_var.set(config.prefill_time)
         self.view.latency_var.set(config.latency)
         self.view.shuffle_var.set(config.shuffle)
+        self.view.repeat_var.set(config.repeat)
         
         if Path(config.recent_playlist).exists():
             self.view.song_list_var.set(config.recent_playlist)
@@ -354,7 +420,8 @@ class Controller:
             latency=self.view.latency_var.get(),
             clip_length=self.view.clip_var.get(),
             fade_duration=self.view.fade_var.get(),
-            shuffle=self.view.shuffle_var.get()
+            shuffle=self.view.shuffle_var.get(),
+            repeat=self.view.repeat_var.get()
         )
         
     def _open_log_file(self, event=None):
@@ -365,6 +432,17 @@ class Controller:
         else:
             logger.error(f"Log file not found: {log_file_path}")
             self.view.show_error("Log File Error", f"Log file not found: {log_file_path}")
+
+    def _clear_log_file(self):
+        """Clear the log file contents."""
+        log_file_path = resource_path("crossmuse.log")
+        try:
+            # Open the file in write mode, which truncates the file
+            with open(log_file_path, 'w') as f:
+                pass  # Just opening in 'w' mode clears the file
+            logger.info("Log file cleared before starting playback")
+        except Exception as e:
+            logger.error(f"Failed to clear log file: {str(e)}")
 
     def _default_audio_dir(self) -> str:
         """Get default audio storage directory."""
@@ -406,21 +484,21 @@ class Controller:
             self.view.after(0, lambda: self.view.update_status(
                 error_message, is_error=True
             ))
-        
+    
         playlists = []
         for i in range(len(result)):
             entry = result[i]
             if isinstance(entry.get('browseId'), str) and len(entry['browseId']) == 36 and entry['browseId'].startswith('VL'):
                 playlists.append({
                     'index': i,
-				    'title': self._clean(entry['title']),
-				    'id': entry['browseId'][2:],
+                    'title': self._clean(entry['title']),
+                    'id': entry['browseId'][2:],
                     'count': "..."
-			    })
+                })
                 logger.info(playlists[len(playlists) - 1])
             else:
                 logger.error(f"Invalid playlist entry: {self._clean(entry['title'])} - {len(entry['browseId'])}")
-            
+        
         # Update GUI on main thread
         self.view.after(0, lambda: self._update_search_results(query, playlists))
 
@@ -430,12 +508,12 @@ class Controller:
                 playlists[i].update({
                     'count': playlist.get('trackCount', 0),
                     'songs': list(map(lambda s: {
-                        "url": "https://music.youtube.com/watch?v=" + s.get("videoId", ""),
+                        "id": s.get("videoId", ""),
                         "title": self._clean(s.get("title", "")),
                         "artists": ", ".join(self._clean(a["name"]) for a in s.get("artists", [])),
                         "duration": s.get("duration_seconds", 0)
                     }, filter(lambda s: s.get("videoId"), playlist.get("tracks", []))))
-			    })
+                })
 
                 # break if a new search has been started
                 if self.search_query != query:
@@ -497,7 +575,90 @@ class Controller:
         """Clean the filename to ensure it contains only standard characters."""
         return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
 
+    def _load_and_upgrade_playlist(self, playlist_path: str) -> list:
+        """Load playlist from JSON file and upgrade if necessary."""
+        PLAYLIST_VERSION = 2  # Current playlist version (using 'id' instead of 'url')
+    
+        try:
+            with open(playlist_path) as f:
+                songs = json.load(f)
+        
+            # Check if we need to upgrade the playlist format
+            needs_upgrade = False
+        
+            # Check if this is a version 1 playlist (has 'url' but no 'id')
+            if songs and 'url' in songs[0] and 'id' not in songs[0]:
+                logger.info(f"Detected version 1 playlist format in {playlist_path}, upgrading to version 2")
+                self.view.update_status(f"Upgrading playlist format...", is_error=False)
+            
+                # Upgrade each song to use 'id' instead of 'url'
+                for song in songs:
+                    if 'url' in song:
+                        # Extract video ID from URL
+                        url = song['url']
+                        video_id = None
+                    
+                        # Try to extract ID from YouTube Music URL
+                        if AudioConfig.YOUTUBE_MUSIC_VIDEO_URL_PREFIX in url:
+                            video_id = url.split("v=")[-1].split("&")[0]
+                    
+                        # If we couldn't extract an ID, skip this song
+                        if not video_id:
+                            logger.warning(f"Could not extract video ID from URL: {url}")
+                            continue
+                    
+                        # Add the ID field and remove the URL field
+                        song['id'] = video_id
+                        song.pop('url', None)  # Remove the 'url' field
+                    
+                        needs_upgrade = True
+            
+                # Save the upgraded playlist
+                if needs_upgrade:
+                    self._save_upgraded_playlist(playlist_path, songs)
+                    logger.info(f"Successfully upgraded playlist to version 2 format")
+                    self.view.update_status(f"Playlist upgraded to new format", is_error=False)
+        
+            # Validate that all songs have the required fields
+            for i, song in enumerate(songs):
+                if 'id' not in song:
+                    logger.warning(f"Song at index {i} is missing 'id' field, skipping")
+                    continue
+            
+                # Ensure all songs have the required fields
+                song['index'] = i
+                if 'title' not in song:
+                    song['title'] = f"Unknown Song {i+1}"
+                if 'artists' not in song:
+                    song['artists'] = "Unknown Artist"
+                if 'duration' not in song:
+                    song['duration'] = 180  # Default to 3 minutes'
+        
+            return songs
+    
+        except Exception as e:
+            logger.error(f"Failed to load playlist: {str(e)}")
+            self.view.show_error("Playlist Error", f"Failed to load playlist: {str(e)}")
+            return []
+    def _save_upgraded_playlist(self, playlist_path: str, songs: list) -> None:
+        """Save the upgraded playlist back to the original file."""
+        try:
+            # Create a backup of the original playlist
+            backup_path = f"{playlist_path}.bak"
+            shutil.copy2(playlist_path, backup_path)
+            logger.info(f"Created backup of original playlist at {backup_path}")
+        
+            # Save the upgraded playlist
+            with open(playlist_path, 'w') as f:
+                json.dump(songs, f, indent=2)
+        
+            logger.info(f"Saved upgraded playlist to {playlist_path}")
+        except Exception as e:
+            logger.error(f"Failed to save upgraded playlist: {str(e)}")
+            self.view.show_error("Playlist Error", f"Failed to save upgraded playlist: {str(e)}")
+
     def _save_playlist(self):
+        """Save the current playlist to a JSON file."""
         if not self.current_playlist:
             return
 
@@ -505,29 +666,61 @@ class Controller:
         clean_title = self._clean_filename(self.current_playlist['title'])
         default_name = f"{clean_title}.json"
         default_path = Path(self.config.playlists_dir) / default_name
-
-        path = self.view.ask_save_filename(
-            initialdir=self.config.playlists_dir,
-            initialfile=default_name,
-            filetypes=(("JSON files", "*.json"), ("All files", "*.*"))
-        )
-        if not path:
-            return
-
+        
+        # Check if a file with the same name already exists
+        file_exists = default_path.exists()
+        save_path = default_path
+        
+        if file_exists:
+            # Show a message about the existing file
+            message = f"A playlist named '{default_name}' already exists. Do you want to overwrite it?"
+            if not self.view.ask_yes_no("Playlist Exists", message):
+                # User chose not to overwrite, show save dialog
+                path = self.view.ask_save_filename(
+                    initialdir=self.config.playlists_dir,
+                    initialfile=default_name,
+                    filetypes=(("JSON files", "*.json"), ("All files", "*.*"))
+                )
+                if not path:
+                    return
+                save_path = path
+        
         try:
-            with open(path, 'w') as f:
-                json.dump(self.current_playlist['songs'], f, indent=2)
+            # Ensure we're saving in the current format (version 2)
+            songs_to_save = []
+            for song in self.current_playlist.get('songs', []):
+                song_data = {
+                    "id": song.get("id", ""),
+                    "title": song.get("title", "Unknown"),
+                    "artists": song.get("artists", "Unknown"),
+                    "duration": song.get("duration", 180)
+                }
+                songs_to_save.append(song_data)
+            
+            with open(save_path, 'w') as f:
+                json.dump(songs_to_save, f, indent=2)
 
-            self.last_saved_path = path
+            self.last_saved_path = str(save_path)
             self.view.update_playlist_button_states(True, True)
-            self.view.update_status(f"Playlist saved to {path}")
+            self.view.update_status(f"Playlist saved to {save_path}")
         except Exception as e:
             self.view.update_status(f"Save failed: {str(e)}", is_error=True)
-            
+
     def _load_playlist(self):
+        """Load the saved playlist into the active playlist slot."""
         if not self.last_saved_path:
             return
-            
+        
+        # Set the playlist in the song_list_var (Configure tab)
         self.view.song_list_var.set(self.last_saved_path)
-        self.view.update_status(f"Loaded playlist {self.last_saved_path}")
+        self.view.song_list_lbl.configure(text=Path(self.last_saved_path).name)
+        
+        # Update the configuration to remember this playlist
+        self.config = self._save_config()
+        
+        # Update the status message
+        self.view.update_status(f"Loaded playlist: {Path(self.last_saved_path).name}")
+        
+        # Update button states
+        self.view.update_playback_button_states(self.playback_active, self.paused)
 

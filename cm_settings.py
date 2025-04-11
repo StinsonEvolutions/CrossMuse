@@ -6,16 +6,23 @@ import platformdirs
 import os
 import sys
 
+from regex import B
+
 @dataclass
 class AudioConfig:
     CONFIG_VERSION = 3  # New version for these changes
+    
+    # YouTube Music constants
+    YOUTUBE_MUSIC_VIDEO_URL_PREFIX = "https://music.youtube.com/watch?v="
 	
     playlist_songs: int = 20  # New config value
     search_matches: int = 5    # New config value
     search_delay: float = 0.5  # Seconds between keystroke and search
     shuffle: bool = False      # Shuffle song order before playing
+    repeat: bool = False       # Repeat the playlist when finished
     
     version: int = CONFIG_VERSION
+
     pause_fade: float = 0.2
     playlists_dir: str = str(Path(platformdirs.user_data_dir("CrossMuse", "Stinson Evolutions")) / "Playlists")
     audio_dir: str = str(Path.home() / "Music" / "CrossMuse Audio Files")
@@ -54,7 +61,7 @@ class AudioConfig:
             raise ValueError("Limiter threshold must be between 0 and 1")
         if not Path(self.playlists_dir).is_dir():
             if not self.playlists_dir == "":
-                os.makedirs(self.playlists_dir, exist_ok=True)
+                os.makedirs(self.audio_dir, exist_ok=True)
         if not Path(self.audio_dir).parent.is_dir():
             if not self.audio_dir == "":
                 os.makedirs(self.playlists_dir, exist_ok=True)

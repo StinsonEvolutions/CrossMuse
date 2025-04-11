@@ -1,4 +1,5 @@
-"""Model: Audio playback module with multiprocessing integration."""
+# cm_player.py
+
 import gc
 import logging
 import queue
@@ -7,7 +8,6 @@ import time
 from typing import Optional
 
 import numpy as np
-from regex import P
 import sounddevice as sd
 import multiprocessing as mp
 import psutil
@@ -15,7 +15,7 @@ import psutil
 from cm_settings import AudioConfig
 from cm_logging import setup_logger
 
-logger = setup_logger(level=logging.DEBUG)
+logger = setup_logger()
 
 class AtomicBuffer:
     """Thread-safe audio buffer using numpy"""
@@ -30,16 +30,17 @@ class AtomicBuffer:
             (buffer_size, config.channels),
             dtype=np.float32
         )
-        # Keep track of the song index for each block
-        self.index_buffer = np.full(int(config.buffer_seconds * config.sample_rate / config.block_size), -1, dtype=np.int32)
+        # Keep track of song id hashes for each block
+        self.id_buffer = np.full(int(config.buffer_seconds * config.sample_rate / config.block_size), -1, dtype=np.int32)
         self.write_pos = 0  # Keep track the write and read location
         self.read_pos = 0
         self.capacity = len(self.buffer)  # Max data it can store in samples
         self.available = 0  # Amount currently available
         self.lock = threading.RLock()  # Protects all read/write operations
         self.underrun_count = 0  # Counts how many times the buffer has to stop playback
+        self.loader_complete = False # Flag to indicate no more data will be written
 
-    def write(self, data: np.ndarray, song_index: int) -> int:
+    def write(self, data: np.ndarray, id_hash: int) -> int:
         """Writes to the buffer"""
         with self.lock:
             write_size = min(len(data), self.capacity - self.available)
@@ -49,42 +50,42 @@ class AtomicBuffer:
             end = self.write_pos % self.capacity
             first_part = min(write_size, self.capacity - end)
             self.buffer[self.write_pos:end + first_part] = data[:first_part]
-            self.index_buffer[(self.write_pos // self.config.block_size) % len(self.index_buffer)] = song_index
-        
+            self.id_buffer[(self.write_pos // self.config.block_size) % len(self.id_buffer)] = id_hash
+
             if first_part < write_size:
                 self.buffer[:write_size - first_part] = data[first_part:write_size]
-                self.index_buffer[0] = song_index
-        
+                self.id_buffer[0] = id_hash
+
             self.write_pos = (self.write_pos + write_size) % self.capacity
             self.available += write_size
             return write_size
 
-    def read(self, requested: int) -> Optional[tuple[np.ndarray, int]]:
+    def read(self, requested: int) -> Optional[tuple[np.ndarray, int, bool]]:
         """Read from buffer"""
         with self.lock:
-            if self.available < requested:
-                self.underrun_count += 1
-                if self.underrun_count == 1:
-                    logger.warn(f"Buffer underrun - not enough processed audio")
-                return None
-        
-            if self.underrun_count > 0:
-                logger.info(f"Buffer ready ({self.underrun_count} underruns)")
-                self.underrun_count = 0
+            if self.available == 0:
+                return None, None, self.loader_complete  # Return None and loader_complete status
 
+            read_size = min(requested, self.available)
             end = self.read_pos % self.capacity
-            first_part = min(requested, self.capacity - end)
-            result = np.empty((requested, self.config.channels), dtype=np.float32)
+            first_part = min(read_size, self.capacity - end)
+            result = np.empty((read_size, self.config.channels), dtype=np.float32)
             result[:first_part] = self.buffer[self.read_pos:end + first_part]
-            song_index = self.index_buffer[(self.read_pos // self.config.block_size) % len(self.index_buffer)]
-        
-            if first_part < requested:
-                result[first_part:] = self.buffer[:requested - first_part]
-        
-            self.read_pos = (self.read_pos + requested) % self.capacity
-            self.available -= requested
-            return result, song_index
+            id_hash = self.id_buffer[(self.read_pos // self.config.block_size) % len(self.id_buffer)]
 
+            remaining = read_size - first_part
+            if remaining > 0:
+                result[first_part:] = self.buffer[:remaining]
+
+            self.read_pos = (self.read_pos + read_size) % self.capacity
+            self.available -= read_size
+
+            # Determine if this is the final read (loader is done and no more data)
+            is_final = self.loader_complete and self.available == 0
+
+            # Return the actual data we have, even if it's less than requested
+            # The audio callback will handle padding with zeros if needed
+            return result, id_hash, is_final
 
 
     def clear(self):
@@ -93,6 +94,7 @@ class AtomicBuffer:
             self.write_pos = 0  # Reset the write position
             self.read_pos = 0  # Reset the read position
             self.available = 0  # indicate nothing was available.
+            self.loader_complete = False # Reset loader_complete on clear
             logger.info("Buffer Cleaned")
 
     def available_seconds(self) -> float:
@@ -111,24 +113,25 @@ class AudioPlayer:
         self.stream: Optional[sd.OutputStream] = None
         self.stop_event = threading.Event()
         self.prefill_complete = threading.Event()
-        self.loader_complete = False
-        self.clips_buffered = 0
+        self.buffer_underrun = False
         self.paused = False
         self.current_volume = 1.0
         self.fade_step = 0.02  # 20ms per step
         self.fade_duration = config.pause_fade
         self._peak_limiter = PeakLimiter(config)
         self._buffer_thread = threading.Thread(target=self._buffer_loop)
-        self.current_song_index = -1
+        self.current_song_id = -1
         self.song_list = {}
+        self.song_hashes = {}  # Dictionary to map hash values to song IDs
 
     def start(self, command_queue: queue.Queue, player_queue: queue.Queue) -> None:
         """Start audio playback system with command queue for IPC."""
         self.player_queue = player_queue
         try:
             logger.info("Starting playback...")
-            
+
             # Open audio stream
+            logger.info(f"Opening audio stream with sample_rate={self.config.sample_rate}, channels={self.config.channels}")
             with sd.OutputStream(
                 samplerate=self.config.sample_rate,
                 channels=self.config.channels,
@@ -137,30 +140,31 @@ class AudioPlayer:
                 callback=self._audio_callback
             ) as stream:
                 self.stream = stream
-                
+                logger.info("Audio stream opened successfully")
+
                 # Start buffering thread
                 self._buffer_thread.start()
+                logger.info("Buffer thread started")
 
                 # Process commands from the main process
                 while not self.stop_event.is_set():
                     try:
                         cmd = command_queue.get_nowait()
+                        logger.info(f"Received command: {cmd}")
                         if cmd == "PAUSE":
                             logger.info("Playback paused")
                             self._handle_pause_fade()
                         elif cmd == "RESUME":
                             logger.info("Playback resumed")
                             self._handle_resume_fade()
+                        elif cmd == "FORCE_START" and not self.prefill_complete.is_set():
+                            logger.info("Forcing playback to start despite buffer not being fully prefilled")
+                            self.prefill_complete.set()
                         elif cmd == "STOP":
                             logger.info("Stopping playback...")
                             break
                     except queue.Empty:
                         pass
-
-                    if self.is_playback_complete():
-                        logger.info("Playback complete")
-                        self.player_queue.put("complete")  # Notify main process
-                        break
 
                     time.sleep(0.1)
 
@@ -176,15 +180,16 @@ class AudioPlayer:
 
         while not self.stop_event.is_set():
             try:
-                index, title, clip = self.processed_clips_queue.get(timeout=0.1)
-                self.song_list[index] = title
-                if (index, title, clip) == (None, None, None):
-                    self.loader_complete = True
+                song_id, title, clip = self.processed_clips_queue.get(timeout=0.1)
+                if (song_id, title, clip) == (None, None, None):
+                    self.buffer.loader_complete = True  # Signal that no more data is coming
                     logger.debug("Received loader completion signal")
                     break
+
+                logger.info(f"Player received processed clip {song_id}. {title} with {len(clip)}")
+                self.song_list[song_id] = title
                 
-                self._safe_buffer(clip, index)
-                self.clips_buffered += 1
+                self._safe_buffer(clip, song_id)
 
                 # Trigger garbage collection if memory usage is high
                 if psutil.virtual_memory().percent > 80:
@@ -194,68 +199,84 @@ class AudioPlayer:
                 # Might just be slow processing - wait for more clips
                 logger.debug("No clips available, waiting...")
                 time.sleep(0.1)
-            
-            # Check prefill status
-            if not self.prefill_complete.is_set():
-                buffer_level = self.buffer.available_seconds()
-                elapsed = time.time() - start_time
-                
-                if buffer_level >= self.config.prefill_time:
-                    self.prefill_complete.set()
-                    logger.info("Prefill target reached (%.1fs)", buffer_level)
-                elif self.loader_complete:
-                    self.prefill_complete.set()
-                    logger.info("Loader complete, starting with %.1fs buffer", buffer_level)
 
         logger.info(
-            "Buffering completed, final buffer level: %.1fs", 
+            "Buffering completed, final buffer level: %.1fs",
             self.buffer.available_seconds()
         )
 
-    def _safe_buffer(self, audio: np.ndarray, song_index: int) -> None:
+    def _safe_buffer(self, audio: np.ndarray, song_id: str) -> None:
         """Safely write audio data to buffer with flow control."""
-        total_written = 0
-        while total_written < len(audio) and not self.stop_event.is_set():
-            chunk = audio[total_written : total_written + self.config.block_size]
-            written = self.buffer.write(chunk, song_index)
-            
+        audio_written = 0
+        prefill_target = self.config.prefill_time * self.config.sample_rate
+        
+        # Create hash for the song_id and store in the mapping dictionary
+        id_hash = self._hash_int32(song_id)
+        self.song_hashes[id_hash] = song_id
+
+        while audio_written < len(audio) and not self.stop_event.is_set():
+            chunk = audio[audio_written : audio_written + self.config.block_size]
+            written = self.buffer.write(chunk, id_hash)
+
             if written > 0:
-                total_written += written
+                audio_written += written
+
+                # Update prefill status
+                if not self.prefill_complete.is_set():
+                    buffer_level = self.buffer.available
+                    percent_buffered = (buffer_level / prefill_target) * 100
+                    self.player_queue.put(f"buffering:{song_id}:{int(percent_buffered)}")
+
+                    if buffer_level >= prefill_target:
+                        logger.info("Prefill target reached (%.1fs)", buffer_level / self.config.sample_rate)
+                        self.prefill_complete.set()
             else:
                 time.sleep(self.config.buffer_backoff)
 
-    def _audio_callback(self, outdata: np.ndarray, frames: int, 
-                      time_info: dict, status: sd.CallbackFlags) -> None:
+    def _audio_callback(self, outdata: np.ndarray, frames: int,
+                time_info: dict, status: sd.CallbackFlags) -> None:
         """Core audio callback handling buffer reading and signal processing."""
         if status:
             logger.warning("Audio device status: %s", status)
-            
-        if self.paused or (not self.prefill_complete.is_set() and not self.loader_complete):
-            outdata.fill(0)
-            return
-        
-        result = self.buffer.read(frames)
-        
-        if result is None:
+
+        if self.paused or not self.prefill_complete.is_set():
             outdata.fill(0)
             return
 
-        data, song_index = result
+        data, id_hash, is_final_read = self.buffer.read(frames)
 
-        # Check if the song index has changed
-        if song_index != self.current_song_index:
-            self.current_song_index = song_index
-            title = self.song_list.pop(song_index, "[Unknown]")
-            self.player_queue.put(f"playing:{song_index}_{title}")
+        # Get the song_id from the hash
+        song_id = self.song_hashes.get(id_hash) if id_hash is not None else None
+
+        if data is None:
+            outdata.fill(0)
+            return
+        
+        # Copy available data to output buffer
+        if len(data) <= frames:
+            outdata[:len(data)] = data
+            if len(data) < frames:
+                outdata[len(data):].fill(0)  # Pad the rest with zeros
+        else:
+            outdata[:] = data[:frames]
+
+        if is_final_read:
+            logger.info("Playback finished, signaling complete.")
+            self.player_queue.put("playback:complete")
+            raise sd.CallbackStop()
+
+        # Check if the song index has changed - modified to handle index 0
+        if song_id is not None and song_id != self.current_song_id:
+            self.current_song_id = song_id
+            title = self.song_list.get(song_id, f"[Unknown:{song_id}]")
+            self.player_queue.put(f"playing:{song_id}:{title}")
 
         # Apply volume adjustment (for pause fading)
-        data *= self.current_volume
+        outdata *= self.current_volume
 
         # Apply peak limiting to prevent clipping
-        self._peak_limiter.apply(data)
-        
-        outdata[:] = data
-        
+        self._peak_limiter.apply(outdata)
+
     def _handle_pause_fade(self):
         target_time = time.time() + self.fade_duration
         while time.time() < target_time and not self.stop_event.is_set():
@@ -272,22 +293,15 @@ class AudioPlayer:
             time.sleep(0.01)
         self.current_volume = 1.0
 
-    def is_playback_complete(self) -> bool:
-        """Determine if playback should conclude."""
-        return (
-            self.loader_complete 
-            and self.buffer.available < self.config.block_size
-        )
-
     def stop(self) -> None:
         """Immediately stop all playback and cleanup resources."""
         logger.info("Stopping playback...")
-        
+
         # Signal stop event for threads and callbacks
         self.stop_event.set()
-        
+
         # Stop and close the audio stream safely
-        if self.stream:
+        if self.stream and self.stream.active:
             try:
                 self.stream.abort()
             except Exception as e:
@@ -297,16 +311,17 @@ class AudioPlayer:
         if self._buffer_thread.is_alive():
             self._buffer_thread.join(timeout=2)
 
+    def _hash_int32(self, id_string: str) -> int:
+        hashed_value = hash(id_string)
+        # Ensure the value is within the 32-bit signed integer range
+        int32_max = 2**31 - 1
+        int32_min = -2**31
+        return hashed_value % (int32_max - int32_min + 1) + int32_min
+
 class PeakLimiter:
     """Prevents audio clipping through peak normalization."""
     def __init__(self, config: AudioConfig):
         self.threshold = config.limiter_threshold
-
-    def apply(self, data: np.ndarray) -> None:
-        """Apply gain reduction to prevent clipping."""
-        peak = np.max(np.abs(data))
-        if peak > self.threshold:
-            data *= self.threshold / peak
 
     def apply(self, data: np.ndarray) -> None:
         """Apply gain reduction to prevent clipping."""

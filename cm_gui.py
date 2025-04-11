@@ -31,6 +31,7 @@ class MainDialog(tk.Toplevel):
         self.prefill_var = tk.IntVar(value=6)
         self.latency_var = tk.StringVar(value="high")
         self.shuffle_var = tk.BooleanVar(value=config.shuffle)
+        self.repeat_var = tk.BooleanVar(value=config.repeat)
 
         self._create_widgets()
         self._setup_validation()
@@ -59,7 +60,7 @@ class MainDialog(tk.Toplevel):
         state = tk.NORMAL if enabled else tk.DISABLED
         for frame in [self.basic_frame, self.advanced_frame]:
             for child in frame.winfo_children():
-                if isinstance(child, (ttk.Entry, ttk.Combobox, ttk.Button)):
+                if isinstance(child, (ttk.Entry, ttk.Combobox, ttk.Button, ttk.Checkbutton)):
                     child.config(state=state)
             
     def display_playlist_songs(self, songs: list):
@@ -106,7 +107,8 @@ class MainDialog(tk.Toplevel):
             "buffer_seconds": self.buffer_var.get(),
             "prefill_time": self.prefill_var.get(),
             "latency": self.latency_var.get(),
-            "shuffle": self.shuffle_var.get()
+            "shuffle": self.shuffle_var.get(),
+            "repeat": self.repeat_var.get()
         }
 
     def set_config(self, config: Dict[str, Any]):
@@ -121,6 +123,7 @@ class MainDialog(tk.Toplevel):
         self.prefill_var.set(config.get("prefill_time", 6))
         self.latency_var.set(config.get("latency", "high"))
         self.shuffle_var.set(config.get("shuffle", False))
+        self.repeat_var.set(config.get("repeat", False))
 
         if self.playlists_dir_var.get():
             self.playlists_dir_lbl.config(text=self.playlists_dir_var.get())
@@ -219,6 +222,8 @@ class MainDialog(tk.Toplevel):
         self.fade_entry = ttk.Entry(self.basic_frame, textvariable=self.fade_var, width=10)
         self.shuffle_label = ttk.Label(self.basic_frame, text="Shuffle")
         self.shuffle_check = ttk.Checkbutton(self.basic_frame, variable=self.shuffle_var)
+        self.repeat_label = ttk.Label(self.basic_frame, text="Repeat")
+        self.repeat_check = ttk.Checkbutton(self.basic_frame, variable=self.repeat_var)
 
     def _create_advanced_settings_components(self):
         # Advanced Settings
@@ -321,6 +326,9 @@ class MainDialog(tk.Toplevel):
 
         self.shuffle_label.grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)  # Add shuffle label to layout
         self.shuffle_check.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)  # Add shuffle checkbox to layout
+
+        self.repeat_label.grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)  # Add repeat label to layout
+        self.repeat_check.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)  # Add repeat checkbox to layout
 
         # --- Advanced Settings Layout ---
 
