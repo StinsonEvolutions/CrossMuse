@@ -256,7 +256,6 @@ class MainDialog(tk.Toplevel):
         self.stop_btn = ttk.Button(self.playback_frame, text="Stop")
 
     def update_status(self, message: str, is_error: bool = False):
-        logger.info(f"Status: {message}")
         self.status_var.set(message)
         self.status_lbl.config(foreground="red" if is_error else "green")
 

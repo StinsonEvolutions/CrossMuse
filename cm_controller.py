@@ -89,6 +89,62 @@ class Controller:
     def _on_shift_mouse_wheel(self, event):
         """Scroll horizontally with shift + mouse wheel."""
         self.view.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    def _update_status(self, message: str, message_type: str = "info", is_error: bool = False) -> bool:
+        """
+        Centralized status message handler with priority management.
+        
+        Args:
+            message: The status message to display
+            message_type: Type of message for priority determination 
+                        ("playing", "processing", "download", "buffering", "audio", "info")
+            is_error: Whether this is an error message
+        
+        Returns:
+            bool: True if the message was displayed, False if suppressed due to priority
+        """
+        logger.info(f"Status update [{message_type}]: {message}")
+        
+        # Error messages always get displayed regardless of priority
+        if is_error:
+            self.view.update_status(message, is_error=True)
+            return True
+            
+        # Define message type priorities (higher number = higher priority)
+        priorities = {
+            "playing": 6,
+            "buffering": 5,
+            "processing": 4,
+            "download": 4,
+            "audio": 2,
+            "info": 1
+        }
+        
+        # Get priority of current message
+        current_priority = priorities.get(message_type, 1)
+        
+        # Get priority of last message type
+        last_priority = priorities.get(self.last_status_message_type, 0)
+        
+        # Determine if we should update the status based on priority
+        should_update = False
+        
+        if current_priority >= last_priority:
+            # Higher or equal priority messages replace current message
+            should_update = True
+        elif self.last_status_message_type == "playing" and self.paused:
+            # If we're paused, allow lower priority messages to show
+            should_update = True
+        elif self.last_status_message_type is None:
+            # If no previous message, always show
+            should_update = True
+            
+        if should_update:
+            self.view.update_status(message, is_error=is_error)
+            self.last_status_message_type = message_type
+            return True
+        
+        return False
 
     def _start_playback(self):
         """Handle playback start/resume."""
@@ -96,12 +152,20 @@ class Controller:
             try:
                 # Clear the log file before starting playback
                 self._clear_log_file()
+                
+                # Reset the last status message type
+                self.last_status_message_type = None
+                
+                # Initial status message
+                self._update_status("Initializing audio engine...", message_type="info")
 
                 config = self._save_config()
                 audio_path = Path(self.view.audio_dir_var.get())
                 if not audio_path.is_absolute():
                     audio_path = Path(self.view.audio_dir_var.get()) / audio_path
                 os.makedirs(audio_path, exist_ok=True)
+                
+                self._update_status("Setting up directories...", message_type="info")
             
                 playlist_path = Path(self.view.playlists_dir_var.get())
                 if not playlist_path.is_absolute():
@@ -109,19 +173,29 @@ class Controller:
                 os.makedirs(playlist_path, exist_ok=True)
             
                 # Load and potentially upgrade the playlist
+                self._update_status("Loading playlist...", message_type="info")
                 songs = self._load_and_upgrade_playlist(self.view.song_list_var.get())
                 
                 logger.debug(f"Starting with config: {config}")
             
                 # Initialize songs_status list
                 for song in songs:
-                    self.songs_status[song['id']] = {'song': song, 'downloaded': False, 'buffered': False, 'played': False}
+                    self.songs_status[song['id']] = {
+                        'song': song, 
+                        'downloaded': False, 
+                        'buffered': False, 
+                        'played': False,
+                        'error': False
+                    }
             
+                self._update_status(f"Preparing {len(songs)} songs for playback...", message_type="info")
+                
                 # Limit the processing queue to a reasonable size - either 4 or the number of songs, whichever is smaller
                 queue_size = min(4, len(songs))
                 self.processed_clips_queue = mp.Queue(queue_size)
                 logger.info(f"Initialized song queue to hold up to {queue_size} songs")
 
+                self._update_status("Starting audio processing...", message_type="info")
                 self.loader_process = mp.Process(
                     target=self._run_song_loader,
                     args=(songs, config.to_dict(), self.processed_clips_queue, self.loader_queue)
@@ -139,11 +213,13 @@ class Controller:
                 # Start the playback manager thread
                 self.playback_manager_thread = threading.Thread(target=self._playback_manager, daemon=True)
                 self.playback_manager_thread.start()
+                
+                self._update_status("Waiting for first song to download...", message_type="info")
 
             except Exception as e:
                 logger.error(f"Failed to start playback: {str(e)}")
                 self.view.show_error("Playback Error", f"Failed to start playback: {str(e)}")
-    
+        
         self.view.update_playback_button_states(self.playback_active, self.paused)
 
     @staticmethod
@@ -176,16 +252,39 @@ class Controller:
                 if message.startswith("download:"):
                     _, song_id, percent_downloaded = message.split(":")
                     song_id, percent_downloaded = str(song_id), float(percent_downloaded)
-                    # Only show downloading messages if the last status message was not a playing message
-                    if self.last_status_message != "playing":
-                        self.view.update_status(f"Downloading {self.songs_status[song_id]['song']['title']}... {percent_downloaded}%")
+                    
+                    song_title = self.songs_status[song_id]['song']['title']
+                    if percent_downloaded < 1:
+                        self._update_status(f"Starting download for {song_title}...", message_type="download")
+                    elif percent_downloaded < 100:
+                        self._update_status(f"Downloading {song_title}... {percent_downloaded:.0f}%", message_type="download")
+                    else:
+                        self._update_status(f"Download complete for {song_title}", message_type="download")
+                    
                     if percent_downloaded > 99:
                         self.songs_status[song_id]['downloaded'] = True
+                
+                elif message.startswith("error:"):
+                    # Handle error messages from the loader
+                    _, song_id, error_message = message.split(":", 2)
+                    song_title = self.songs_status[song_id]['song']['title']
+                    error_text = f"Error processing {song_title}: {error_message}"
+                    logger.error(error_text)
+                    self._update_status(error_text, message_type="info", is_error=True)
+                    
+                    # Mark the song as having an error
+                    self.songs_status[song_id]['error'] = True
+                
                 elif message == "loader:complete":
                     # All songs have been processed, force playback to start if needed
                     logger.info("Received loader completion notification, forcing playback to start if needed")
                     self.command_queue.put("FORCE_START")
-                    self.view.update_status("All songs processed, starting playback")
+                    self._update_status("All songs processed, starting playback", message_type="processing")
+                
+                elif message.startswith("processing:"):
+                    _, song_id = message.split(":", 1)
+                    song_title = self.songs_status[song_id]['song']['title']
+                    self._update_status(f"Processing {song_title}...", message_type="processing")
 
             except queue.Empty:
                 break
@@ -197,7 +296,7 @@ class Controller:
                 message = self.player_queue.get_nowait()
 
                 if message == "playback:complete":
-                    self.view.update_status("Playback complete")
+                    self._update_status("Playback complete", message_type="info")
                     if self.current_song['id'] is not None:  # Check if we have a valid current song
                         self.songs_status[self.current_song['id']]['played'] = True
                     
@@ -206,27 +305,40 @@ class Controller:
                         self._stop()
                     else:
                         # Just update the status to indicate we're continuing in repeat mode
-                        self.view.update_status("Continuing playback (repeat mode)")
+                        self._update_status("Continuing playback (repeat mode)", message_type="info")
 
                 elif message.startswith("buffering:"):
                     _, song_id, percent_buffered = message.split(":", 2)
                     song_id, percent_buffered = str(song_id), float(percent_buffered)
-                    self.view.update_status(f"Buffering... {percent_buffered}%")
+                    
+                    if percent_buffered < 1:
+                        self._update_status("Starting buffer fill...", message_type="buffering")
+                    elif percent_buffered < 99:
+                        self._update_status(f"Buffering... {percent_buffered:.0f}%", message_type="buffering")
+                    else:
+                        self._update_status("Buffering complete", message_type="buffering")
+                    
                     if percent_buffered >= 99:
-                        self.view.update_status("Buffering complete")
                         self.songs_status[song_id]['buffered'] = True
+                        
                         # If a song was already playing (ie. buffering to catch up), show playing message again
                         if self.current_song['id'] is not None:
-                            self.view.update_status(f"Playing {self.songs_status[self.current_song['id']]['song']['index'] + 1}. {self.current_song['title']}")
-                            self.last_status_message = "playing"
+                            song_index = self.songs_status[self.current_song['id']]['song']['index'] + 1
+                            self._update_status(f"Playing {song_index}. {self.current_song['title']}", message_type="playing")
 
                 elif message.startswith("playing:"):
+                    # Playing messages always have the highest priority
                     _, song_id, title = message.split(":", 2)
                     if self.current_song['id'] is not None:
                         self.songs_status[self.current_song['id']]['played'] = True
                     self.current_song = {'id': song_id, 'title': title}
-                    self.view.update_status(f"Playing {self.songs_status[self.current_song['id']]['song']['index'] + 1}. {self.current_song['title']}")
-                    self.last_status_message = "playing"
+                    song_index = self.songs_status[self.current_song['id']]['song']['index'] + 1
+                    self._update_status(f"Playing {song_index}. {self.current_song['title']}", message_type="playing")
+                    
+                elif message.startswith("audio:"):
+                    # Audio system messages have lower priority
+                    _, status_msg = message.split(":", 1)
+                    self._update_status(f"Audio system: {status_msg}", message_type="audio")
 
             except queue.Empty:
                 break
@@ -235,14 +347,19 @@ class Controller:
         """Toggle pause state."""
         if self.playback_active:
             if self.paused:
+                self._update_status("Resuming playback...", message_type="info")
                 self.command_queue.put("RESUME")
             else:
+                self._update_status("Pausing playback...", message_type="info")
                 self.command_queue.put("PAUSE")
             self.paused = not self.paused
             self.view.update_playback_button_states(self.playback_active, self.paused)
-            
+
     def _stop(self):
         logger.info("Shutting down...")
+        
+        self._update_status("Stopping playback...", message_type="info")
+        
         if self.playback_active:
             self.command_queue.put("STOP")
             
@@ -250,15 +367,18 @@ class Controller:
             self.loader_process.join(timeout=5)
             if self.loader_process.is_alive():
                 logger.warning("Forcibly terminating loader process")
+                self._update_status("Forcibly terminating loader process...", message_type="info")
                 self.loader_process.terminate()
         
         if self.player_process:
             self.player_process.join(timeout=5)
             if self.player_process.is_alive():
                 logger.warning("Forcibly terminating player process")
+                self._update_status("Forcibly terminating player process...", message_type="info")
                 self.player_process.terminate()
         
         logger.info("Application shutdown complete")
+        self._update_status("Playback stopped", message_type="info")
         self._reset_playback()
 
     def _reset_playback(self):
@@ -272,7 +392,7 @@ class Controller:
         self.loader_queue: mp.Queue = mp.Queue()
         self.playback_manager_thread = None
         self.current_song = {'id': None, 'title': None}
-        self.last_status_message = None  # Track the last status message type
+        self.last_status_message_type = None  # Track the last status message type
 
         self.view.update_status("")
         self.view.update_playback_button_states(self.playback_active, self.paused)
@@ -578,7 +698,7 @@ class Controller:
     def _load_and_upgrade_playlist(self, playlist_path: str) -> list:
         """Load playlist from JSON file and upgrade if necessary."""
         PLAYLIST_VERSION = 2  # Current playlist version (using 'id' instead of 'url')
-    
+
         try:
             with open(playlist_path) as f:
                 songs = json.load(f)
@@ -613,11 +733,49 @@ class Controller:
                     
                         needs_upgrade = True
             
-                # Save the upgraded playlist
-                if needs_upgrade:
-                    self._save_upgraded_playlist(playlist_path, songs)
-                    logger.info(f"Successfully upgraded playlist to version 2 format")
-                    self.view.update_status(f"Playlist upgraded to new format", is_error=False)
+            # Check for duration in time format and convert to seconds
+            for song in songs:
+                if 'duration' in song and isinstance(song['duration'], str):
+                    # Check if duration is in time format (contains colons)
+                    if ':' in song['duration']:
+                        try:
+                            # Split by colon and convert to seconds
+                            parts = song['duration'].split(':')
+                            
+                            # Handle different formats (H:M:S or M:S)
+                            if len(parts) == 3:  # H:M:S format
+                                hours, minutes, seconds = map(int, parts)
+                                total_seconds = hours * 3600 + minutes * 60 + seconds
+                            elif len(parts) == 2:  # M:S format
+                                minutes, seconds = map(int, parts)
+                                total_seconds = minutes * 60 + seconds
+                            else:
+                                # Unexpected format, default to 180 seconds
+                                logger.warning(f"Unexpected time format '{song['duration']}' for song '{song.get('title', 'Unknown')}', defaulting to 180 seconds")
+                                total_seconds = 180
+                            
+                            logger.info(f"Converted duration for '{song.get('title', 'Unknown')}' from {song['duration']} to {total_seconds} seconds")
+                            song['duration'] = total_seconds
+                            needs_upgrade = True
+                        except ValueError:
+                            logger.warning(f"Could not parse duration '{song['duration']}' for song '{song.get('title', 'Unknown')}', defaulting to 180 seconds")
+                            song['duration'] = 180
+                            needs_upgrade = True
+                    else:
+                        # Try to convert string to integer
+                        try:
+                            song['duration'] = int(song['duration'])
+                            needs_upgrade = True
+                        except ValueError:
+                            logger.warning(f"Could not convert duration '{song['duration']}' to integer for song '{song.get('title', 'Unknown')}', defaulting to 180 seconds")
+                            song['duration'] = 180
+                            needs_upgrade = True
+            
+            # Save the upgraded playlist if needed
+            if needs_upgrade:
+                self._save_upgraded_playlist(playlist_path, songs)
+                logger.info(f"Successfully upgraded playlist format")
+                self.view.update_status(f"Playlist upgraded to new format", is_error=False)
         
             # Validate that all songs have the required fields
             for i, song in enumerate(songs):
@@ -632,14 +790,15 @@ class Controller:
                 if 'artists' not in song:
                     song['artists'] = "Unknown Artist"
                 if 'duration' not in song:
-                    song['duration'] = 180  # Default to 3 minutes'
+                    song['duration'] = 180  # Default to 3 minutes
         
             return songs
-    
+
         except Exception as e:
             logger.error(f"Failed to load playlist: {str(e)}")
             self.view.show_error("Playlist Error", f"Failed to load playlist: {str(e)}")
             return []
+    
     def _save_upgraded_playlist(self, playlist_path: str, songs: list) -> None:
         """Save the upgraded playlist back to the original file."""
         try:
@@ -689,11 +848,35 @@ class Controller:
             # Ensure we're saving in the current format (version 2)
             songs_to_save = []
             for song in self.current_playlist.get('songs', []):
+                # Ensure duration is an integer
+                duration = song.get("duration", 180)
+                if isinstance(duration, str):
+                    try:
+                        # Split by colon and convert to seconds if in time format
+                        if ':' in duration:
+                            parts = duration.split(':')
+                            
+                            # Handle different formats (H:M:S or M:S)
+                            if len(parts) == 3:  # H:M:S format
+                                hours, minutes, seconds = map(int, parts)
+                                duration = hours * 3600 + minutes * 60 + seconds
+                            elif len(parts) == 2:  # M:S format
+                                minutes, seconds = map(int, parts)
+                                duration = minutes * 60 + seconds
+                            else:
+                                # Unexpected format, default to 180 seconds
+                                logger.warning(f"Unexpected time format '{duration}' for song '{song.get('title', 'Unknown')}', defaulting to 180 seconds")
+                                duration = 180
+                        else:
+                            duration = int(duration)
+                    except ValueError:
+                        duration = 180
+                
                 song_data = {
                     "id": song.get("id", ""),
                     "title": song.get("title", "Unknown"),
                     "artists": song.get("artists", "Unknown"),
-                    "duration": song.get("duration", 180)
+                    "duration": duration
                 }
                 songs_to_save.append(song_data)
             

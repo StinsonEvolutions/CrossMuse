@@ -129,6 +129,7 @@ class AudioPlayer:
         self.player_queue = player_queue
         try:
             logger.info("Starting playback...")
+            self.player_queue.put("audio:initializing sound device")
 
             # Open audio stream
             logger.info(f"Opening audio stream with sample_rate={self.config.sample_rate}, channels={self.config.channels}")
@@ -141,10 +142,12 @@ class AudioPlayer:
             ) as stream:
                 self.stream = stream
                 logger.info("Audio stream opened successfully")
+                self.player_queue.put("audio:stream opened successfully")
 
                 # Start buffering thread
                 self._buffer_thread.start()
                 logger.info("Buffer thread started")
+                self.player_queue.put("audio:buffer thread started")
 
                 # Process commands from the main process
                 while not self.stop_event.is_set():
@@ -153,15 +156,21 @@ class AudioPlayer:
                         logger.info(f"Received command: {cmd}")
                         if cmd == "PAUSE":
                             logger.info("Playback paused")
+                            self.player_queue.put("audio:pausing playback")
                             self._handle_pause_fade()
+                            self.player_queue.put("audio:playback paused")
                         elif cmd == "RESUME":
                             logger.info("Playback resumed")
+                            self.player_queue.put("audio:resuming playback")
                             self._handle_resume_fade()
+                            self.player_queue.put("audio:playback resumed")
                         elif cmd == "FORCE_START" and not self.prefill_complete.is_set():
                             logger.info("Forcing playback to start despite buffer not being fully prefilled")
+                            self.player_queue.put("audio:forcing playback to start")
                             self.prefill_complete.set()
                         elif cmd == "STOP":
                             logger.info("Stopping playback...")
+                            self.player_queue.put("audio:stopping playback")
                             break
                     except queue.Empty:
                         pass
@@ -170,6 +179,7 @@ class AudioPlayer:
 
         except Exception as e:
             logger.error("Playback failed: %s", str(e))
+            self.player_queue.put(f"audio:playback failed: {str(e)}")
         finally:
             self.stop()
 
@@ -177,6 +187,7 @@ class AudioPlayer:
         """Unified buffering loop handling both prefill and continuous loading."""
         start_time = time.time()
         logger.info("Starting buffering system (target: %.1fs)", self.config.prefill_time)
+        self.player_queue.put(f"audio:starting buffer fill (target: {self.config.prefill_time}s)")
 
         while not self.stop_event.is_set():
             try:
@@ -184,9 +195,11 @@ class AudioPlayer:
                 if (song_id, title, clip) == (None, None, None):
                     self.buffer.loader_complete = True  # Signal that no more data is coming
                     logger.debug("Received loader completion signal")
+                    self.player_queue.put("audio:all songs processed")
                     break
 
                 logger.info(f"Player received processed clip {song_id}. {title} with {len(clip)}")
+                self.player_queue.put(f"audio:received clip for {title}")
                 self.song_list[song_id] = title
                 
                 self._safe_buffer(clip, song_id)
@@ -194,6 +207,7 @@ class AudioPlayer:
                 # Trigger garbage collection if memory usage is high
                 if psutil.virtual_memory().percent > 80:
                     gc.collect()
+                    self.player_queue.put("audio:performed memory cleanup")
 
             except queue.Empty:
                 # Might just be slow processing - wait for more clips
@@ -204,6 +218,8 @@ class AudioPlayer:
             "Buffering completed, final buffer level: %.1fs",
             self.buffer.available_seconds()
         )
+        self.player_queue.put(f"audio:buffer fill complete ({self.buffer.available_seconds():.1f}s)")
+
 
     def _safe_buffer(self, audio: np.ndarray, song_id: str) -> None:
         """Safely write audio data to buffer with flow control."""
@@ -214,6 +230,9 @@ class AudioPlayer:
         id_hash = self._hash_int32(song_id)
         self.song_hashes[id_hash] = song_id
 
+        # Initial buffering status
+        last_percent = -1
+        
         while audio_written < len(audio) and not self.stop_event.is_set():
             chunk = audio[audio_written : audio_written + self.config.block_size]
             written = self.buffer.write(chunk, id_hash)
@@ -225,23 +244,37 @@ class AudioPlayer:
                 if not self.prefill_complete.is_set():
                     buffer_level = self.buffer.available
                     percent_buffered = (buffer_level / prefill_target) * 100
-                    self.player_queue.put(f"buffering:{song_id}:{int(percent_buffered)}")
+                    
+                    # Only send updates when the percentage changes significantly (every 5%)
+                    current_percent = int(percent_buffered / 5) * 5
+                    if current_percent != last_percent:
+                        self.player_queue.put(f"buffering:{song_id}:{percent_buffered}")
+                        last_percent = current_percent
 
                     if buffer_level >= prefill_target:
                         logger.info("Prefill target reached (%.1fs)", buffer_level / self.config.sample_rate)
+                        self.player_queue.put(f"audio:prefill target reached ({buffer_level / self.config.sample_rate:.1f}s)")
                         self.prefill_complete.set()
             else:
                 time.sleep(self.config.buffer_backoff)
 
-    def _audio_callback(self, outdata: np.ndarray, frames: int,
-                time_info: dict, status: sd.CallbackFlags) -> None:
-        """Core audio callback handling buffer reading and signal processing."""
-        if status:
-            logger.warning("Audio device status: %s", status)
 
+    def _audio_callback(self, outdata: np.ndarray, frames: int,
+        time_info: dict, status: sd.CallbackFlags) -> None:
+        """Core audio callback handling buffer reading and signal processing."""
+        # Fill with silence and return early if we're paused or prefill isn't complete
         if self.paused or not self.prefill_complete.is_set():
             outdata.fill(0)
+            # Don't log status messages during initial prefill to avoid false alarms
+            if status and self.prefill_complete.is_set():
+                logger.warning("Audio device status: %s", status)
+                self.player_queue.put(f"audio:device status issue: {status}")
             return
+
+        # Now we can log any status issues since we're actually playing
+        if status:
+            logger.warning("Audio device status: %s", status)
+            self.player_queue.put(f"audio:device status issue: {status}")
 
         data, id_hash, is_final_read = self.buffer.read(frames)
 
@@ -250,7 +283,14 @@ class AudioPlayer:
 
         if data is None:
             outdata.fill(0)
+            if self.buffer_underrun == False:
+                self.buffer_underrun = True
+                self.player_queue.put("audio:buffer underrun detected")
             return
+        
+        if self.buffer_underrun:
+            self.buffer_underrun = False
+            self.player_queue.put("audio:playback resumed after buffer underrun")
         
         # Copy available data to output buffer
         if len(data) <= frames:
@@ -262,6 +302,7 @@ class AudioPlayer:
 
         if is_final_read:
             logger.info("Playback finished, signaling complete.")
+            self.player_queue.put("audio:reached end of playlist")
             self.player_queue.put("playback:complete")
             raise sd.CallbackStop()
 

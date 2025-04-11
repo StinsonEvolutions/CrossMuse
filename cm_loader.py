@@ -264,28 +264,47 @@ class SongLoader:
         song_id = song['id']
         
         logger.info(f"Processing song {song_id}. {song['title']} (id: {song_id})")
-    
+
         try:
+            # Calculate clip timing parameters first
+            clip_length = self.config.clip_length
+            song_duration = song.get('duration', 0)
+            
+            # Default to full song if clip_length is 0 or greater than song duration
+            if clip_length <= 0 or clip_length > song_duration:
+                start_time = 0
+                end_time = song_duration
+                clip_length = song_duration
+            else:
+                # Calculate weighted random start time towards the center of the song
+                max_start_time = max(0, song_duration - clip_length)
+                if max_start_time > 0:
+                    center = max_start_time / 2
+                    deviation = max_start_time / 4  # Adjust deviation as needed
+                    start_time = int(random.gauss(center, deviation))
+                    start_time = max(0, min(start_time, max_start_time))  # Clamp to valid range
+                else:
+                    start_time = 0
+                end_time = start_time + clip_length
+            
             # Download the song
-            file_path = self._download_song(song)
+            download_full = (clip_length > song_duration * 0.5) if song_duration > 0 else True
+            file_path = self._download_song(song, start_time, end_time, download_full)
             logger.info(f"Downloaded {song['title']} to path {file_path}")
             
             # Load and process the audio
-            audio = self._load_and_process(file_path)
+            self.loader_queue.put(f"processing:{song_id}")
+            audio = self._load_and_process(file_path, start_time, end_time, download_full)
         
-            # Calculate timing parameters
-            clip_length = self.config.clip_length
-            if self.config.clip_length == 0 or self.config.clip_length > len(audio) / self.config.sample_rate:
+            # Adjust clip length if needed based on actual audio length
+            if clip_length == 0 or clip_length > len(audio) / self.config.sample_rate:
                 clip_length = len(audio) / self.config.sample_rate
-            
             logger.info(f"Processed {song['title']} with clip length {clip_length}")
 
-            clip_samples = int(clip_length * self.config.sample_rate)
             fade_samples = int(min(self.config.fade_duration, clip_length / 2) * self.config.sample_rate)
         
             # Apply fades to the clip
             self._apply_fades(audio, fade_samples)
-            
             logger.info(f"Applied fades to {song['title']}")
             
             # Wait until previous song has been processed
@@ -294,11 +313,10 @@ class SongLoader:
                 self.ready_events[song['prevId']].clear()
 
             processed_clip = self._apply_crossfade(song_id, audio, fade_samples, is_final_song)
+            logger.info(f"Applied crossfades to {song['title']}")
             # Store the tail for the next song
             self.previous_tail = audio[-fade_samples:]
-            
-            logger.info(f"Applied crossfades to {song['title']}")
-    
+
             # Track the clip length (in seconds)
             clip_length_seconds = len(processed_clip) / self.config.sample_rate
             with self.clip_lengths_lock:
@@ -317,6 +335,111 @@ class SongLoader:
         except Exception as e:
             logger.error(f"Failed to process {song['title']}: {str(e)}")
             return False
+
+    def _download_song(self, song: Dict, start_time: int, end_time: int, download_full: bool) -> str:
+        """Downloads the song from YouTube using yt_dlp"""
+        song_id = song['id']
+        song_url = f"{AudioConfig.YOUTUBE_MUSIC_VIDEO_URL_PREFIX}{song_id}"
+
+        def progress_hook(progress):
+            if progress['status'] in ['downloading', 'finished']:
+                percent = progress['_percent']
+                self.loader_queue.put(f"download:{song['id']}:{percent:.0f}")
+
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': str(int(self.config.sample_rate / 1000))
+            }],
+            'outtmpl': os.path.join(self.config.audio_dir, '%(title)s.%(ext)s'),
+            'quiet': True,
+            'progress_hooks': [progress_hook],
+            'force_download': True,
+            'socket_timeout': 30,
+            'retries': 3,
+            'fragment_retries': 3,
+            'skip_unavailable_fragments': True,
+        }
+        
+        # Only set download range if we're not downloading the full song
+        if not download_full and self.config.clip_length > 0:
+            logger.info(f"Downloading clip from {start_time}s to {end_time}s")
+            ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func([], [[start_time, end_time]])
+        else:
+            logger.info(f"Downloading full song (clip length > 50% of song)")
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                logger.info(f"Downloading {song['title']}...")
+                info = ydl.extract_info(song_url, download=False)
+                base_filepath = ydl.prepare_filename(info).rsplit('.', 1)[0]
+                base_filename = os.path.basename(base_filepath)
+                base_filepath += ".mp3"
+                desired_filepath = os.path.join(self.config.audio_dir, f"{self.sanitize_filename(base_filename)}_{song_id}.mp3")
+
+                # Note: only downloading clip, so download and overwrite every time
+                self.loader_queue.put(f"download:{song['id']}:0")
+                
+                # Set a timeout for the download
+                download_success = False
+                download_attempts = 0
+                max_attempts = 3
+                
+                while not download_success and download_attempts < max_attempts:
+                    try:
+                        download_attempts += 1
+                        ydl.download([song_url])
+                        download_success = True
+                    except yt_dlp.utils.DownloadError as e:
+                        logger.error(f"Download attempt {download_attempts} failed: {str(e)}")
+                        if download_attempts >= max_attempts:
+                            raise
+                        time.sleep(2)  # Wait before retrying
+                
+                logger.info(f"Downloaded {song['title']}")
+                
+                # Check if the file exists before trying to move it
+                if os.path.exists(base_filepath):
+                    os.replace(base_filepath, desired_filepath)
+                else:
+                    raise FileNotFoundError(f"Expected file not found: {base_filepath}")
+
+                return desired_filepath
+        except Exception as e:
+            logger.error(f"Failed to download {song['title']}: {str(e)}")
+            # Return a fallback or raise the exception
+            raise
+
+    def _load_and_process(self, filepath: str, start_time: int, end_time: int, downloaded_full: bool) -> np.ndarray:
+        """Load and normalize audio file to numpy array."""
+        audio = AudioSegment.from_file(filepath).set_channels(
+            self.config.channels
+        ).set_frame_rate(
+            self.config.sample_rate
+        ).apply_gain(self.config.volume_adjustment)
+        
+        # If we downloaded the full song but only want a clip, extract it here
+        if downloaded_full and self.config.clip_length > 0:
+            start_ms = start_time * 1000  # Convert to milliseconds
+            end_ms = end_time * 1000      # Convert to milliseconds
+            
+            # Ensure we don't exceed the audio length
+            if end_ms > len(audio):
+                end_ms = len(audio)
+            
+            logger.info(f"Extracting clip from {start_ms}ms to {end_ms}ms from full audio")
+            audio = audio[start_ms:end_ms]
+        
+        # Ensure the audio segment is limited to the clip length
+        elif self.config.clip_length > 0 and not downloaded_full:
+            clip_length_ms = self.config.clip_length * 1000  # Convert to milliseconds
+            audio = audio[:clip_length_ms]
+        
+        samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
+        return (samples / np.iinfo(np.int16).max).reshape(-1, self.config.channels)
 
     def _apply_fades(self, clip: np.ndarray, fade_samples: int) -> None:
         """Apply fade in and fade out to the clip"""
@@ -346,69 +469,8 @@ class SongLoader:
         logger.debug(f"Song {song_id} processed - {len(processed_clip)} samples")
         return processed_clip
 
-
-    def _download_song(self, song: Dict) -> str:
-        """Downloads the song from YouTube using yt_dlp"""
-        clip_length = self.config.clip_length
-        song_id = song['id']
-        song_url = f"{AudioConfig.YOUTUBE_MUSIC_VIDEO_URL_PREFIX}{song_id}"
-
-        def progress_hook(progress):
-            if progress['status'] in ['downloading', 'finished']:
-                percent = progress['_percent']
-                self.loader_queue.put(f"download:{song['id']}:{percent:.0f}")
-
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': str(int(self.config.sample_rate / 1000)),
-            }],
-            'outtmpl': os.path.join(self.config.audio_dir, '%(title)s.%(ext)s'),
-            'quiet': True,
-            'progress_hooks': [progress_hook],
-            'force_download': True
-        }
-        if clip_length > 0:
-            start_time = random.randint(0, max(0, int(song['duration']) - clip_length))
-            end_time = start_time + clip_length
-            ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func([], [[start_time, end_time]])
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info(f"Downloading {song['title']}...")
-            info = ydl.extract_info(song_url, download=False)
-            base_filepath = ydl.prepare_filename(info).rsplit('.', 1)[0]
-            base_filename = os.path.basename(base_filepath)
-            base_filepath += ".mp3"
-            desired_filepath = os.path.join(self.config.audio_dir, f"{self.sanitize_filename(base_filename)}_{song_id}.mp3")
-
-            # Note: only downloading clip, so download and overwrite every time
-            self.loader_queue.put(f"download:{song['id']}:0")
-            ydl.download([song_url])
-            logger.info(f"Downloaded {song['title']}")
-            os.replace(base_filepath, desired_filepath)
-
-            return desired_filepath
-
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename to be compatible with most file systems."""
         filename = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode('ascii')
         invalid_chars = r'[<>:"/\\|?*.]'
         return re.sub(invalid_chars, "_", filename)
-
-    def _load_and_process(self, filepath: str) -> np.ndarray:
-        """Load and normalize audio file to numpy array."""
-        audio = AudioSegment.from_file(filepath).set_channels(
-            self.config.channels
-        ).set_frame_rate(
-            self.config.sample_rate
-        ).apply_gain(self.config.volume_adjustment)
-    
-        # Ensure the audio segment is limited to the clip length
-        if self.config.clip_length > 0:
-            clip_length_ms = self.config.clip_length * 1000  # Convert to milliseconds
-            audio = audio[:clip_length_ms]
-        
-        samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
-        return (samples / np.iinfo(np.int16).max).reshape(-1, self.config.channels)
