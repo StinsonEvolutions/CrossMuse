@@ -98,11 +98,11 @@ class SongLoader:
         """Monitor the processing queue and add more songs as needed."""
         while not self.complete_event.is_set():               
             with self.queue_lock:
-                # Check the total length of clips in the queue
+                # Check the total length of processing + processed clips
                 queue_length_seconds = self._queue_clips_length()
-
-                # Then check if we need to add more songs to the queue
-                if (queue_length_seconds < self.config.buffer_seconds):
+                
+                # Add songs to the queue iff processed + processing < buffer size
+                if (queue_length_seconds  < self.config.buffer_seconds):
                     
                     if len(self.processed_songs) >= len(self.songs):
                         # If repeat enabled, reset cycle
@@ -209,7 +209,7 @@ class SongLoader:
         """Return the total length of audio clips in the processed_clips queue in seconds."""
         with self.clip_lengths_lock:
             # Check if we need to sync our tracking with the actual queue size
-            queue_size = self.processed_clips.qsize()
+            queue_size = len(self.processing_queue) + self.processed_clips.qsize()
         
             # If our tracking has more items than the queue, remove items from the start
             # This happens when the player process has consumed items from the queue
@@ -267,34 +267,21 @@ class SongLoader:
 
         try:
             # Calculate clip timing parameters first
-            clip_length = self.config.clip_length
             song_duration = song.get('duration', 0)
-            
-            # Default to full song if clip_length is 0 or greater than song duration
-            if clip_length <= 0 or clip_length > song_duration:
-                start_time = 0
-                end_time = song_duration
-                clip_length = song_duration
-            else:
-                # Calculate weighted random start time towards the center of the song
-                max_start_time = max(0, song_duration - clip_length)
-                if max_start_time > 0:
-                    center = max_start_time / 2
-                    deviation = max_start_time / 4  # Adjust deviation as needed
-                    start_time = int(random.gauss(center, deviation))
-                    start_time = max(0, min(start_time, max_start_time))  # Clamp to valid range
-                else:
-                    start_time = 0
-                end_time = start_time + clip_length
+            start_time, clip_length = self._calculate_clip_timing(song_duration)
+
+            # Track the clip length (in seconds)
+            with self.clip_lengths_lock:
+                self.clip_lengths.append(clip_length or 30) # Default to 30 seconds for bad/missing metadata
             
             # Download the song
             download_full = (clip_length > song_duration * 0.5) if song_duration > 0 else True
-            file_path = self._download_song(song, start_time, end_time, download_full)
+            file_path = self._download_song(song, start_time, clip_length, download_full)
             logger.info(f"Downloaded {song['title']} to path {file_path}")
             
             # Load and process the audio
             self.loader_queue.put(f"processing:{song_id}")
-            audio = self._load_and_process(file_path, start_time, end_time, download_full)
+            audio = self._load_and_process(file_path, start_time, clip_length, download_full)
         
             # Adjust clip length if needed based on actual audio length
             if clip_length == 0 or clip_length > len(audio) / self.config.sample_rate:
@@ -316,11 +303,6 @@ class SongLoader:
             logger.info(f"Applied crossfades to {song['title']}")
             # Store the tail for the next song
             self.previous_tail = audio[-fade_samples:]
-
-            # Track the clip length (in seconds)
-            clip_length_seconds = len(processed_clip) / self.config.sample_rate
-            with self.clip_lengths_lock:
-                self.clip_lengths.append(clip_length_seconds)
         
             # Send to player
             self.processed_clips.put((song_id, song['title'], processed_clip))
@@ -336,7 +318,7 @@ class SongLoader:
             logger.error(f"Failed to process {song['title']}: {str(e)}")
             return False
 
-    def _download_song(self, song: Dict, start_time: int, end_time: int, download_full: bool) -> str:
+    def _download_song(self, song: Dict, start_time: int, duration: int, download_full: bool) -> str:
         """Downloads the song from YouTube using yt_dlp"""
         song_id = song['id']
         song_url = f"{AudioConfig.YOUTUBE_MUSIC_VIDEO_URL_PREFIX}{song_id}"
@@ -366,8 +348,8 @@ class SongLoader:
         
         # Only set download range if we're not downloading the full song
         if not download_full and self.config.clip_length > 0:
-            logger.info(f"Downloading clip from {start_time}s to {end_time}s")
-            ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func([], [[start_time, end_time]])
+            logger.info(f"Downloading clip from {start_time}s to {start_time + duration}s")
+            ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func([], [[start_time, start_time + duration]])
         else:
             logger.info(f"Downloading full song (clip length > 50% of song)")
 
@@ -413,18 +395,26 @@ class SongLoader:
             # Return a fallback or raise the exception
             raise
 
-    def _load_and_process(self, filepath: str, start_time: int, end_time: int, downloaded_full: bool) -> np.ndarray:
+    def _load_and_process(self, filepath: str, start_time: int, clip_length: int, downloaded_full: bool) -> np.ndarray:
         """Load and normalize audio file to numpy array."""
         audio = AudioSegment.from_file(filepath).set_channels(
             self.config.channels
         ).set_frame_rate(
             self.config.sample_rate
         ).apply_gain(self.config.volume_adjustment)
+
+        # Identify actual song length (handles case where bad metadata with missing duration)
+        actual_length = len(audio) / 1000  # AudioSegment length is in milliseconds
+        
+        # If start_time >= clip_length, recalculate using actual audio length
+        if start_time >= clip_length:
+            logger.info(f"Invalid clip timing detected. Recalculating based on actual audio length of {actual_length}s")
+            start_time, clip_length = self._calculate_clip_timing(actual_length)
         
         # If we downloaded the full song but only want a clip, extract it here
         if downloaded_full and self.config.clip_length > 0:
             start_ms = start_time * 1000  # Convert to milliseconds
-            end_ms = end_time * 1000      # Convert to milliseconds
+            end_ms = (start_time + clip_length) * 1000  # Convert to milliseconds
             
             # Ensure we don't exceed the audio length
             if end_ms > len(audio):
@@ -435,11 +425,42 @@ class SongLoader:
         
         # Ensure the audio segment is limited to the clip length
         elif self.config.clip_length > 0 and not downloaded_full:
-            clip_length_ms = self.config.clip_length * 1000  # Convert to milliseconds
+            clip_length_ms = clip_length * 1000  # Convert to milliseconds
             audio = audio[:clip_length_ms]
         
         samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
         return (samples / np.iinfo(np.int16).max).reshape(-1, self.config.channels)
+    
+    def _calculate_clip_timing(self, song_duration, clip_length=None):
+        """
+        Calculate clip timing parameters based on song duration and desired clip length.
+        
+        Args:
+            song_duration: Duration of the song in seconds
+            clip_length: Desired clip length (defaults to config.clip_length if None)
+        
+        Returns:
+            tuple: (start_time, clip_length) in seconds
+        """
+        if clip_length is None:
+            clip_length = self.config.clip_length
+        
+        # Default to full song if clip_length is 0 or greater than song duration
+        if clip_length <= 0 or clip_length > song_duration:
+            start_time = 0
+            clip_length = song_duration
+        else:
+            # Calculate weighted random start time towards the center of the song
+            max_start_time = max(0, song_duration - clip_length)
+            if max_start_time > 0:
+                center = max_start_time / 2
+                deviation = max_start_time / 4  # Adjust deviation as needed
+                start_time = int(random.gauss(center, deviation))
+                start_time = max(0, min(start_time, max_start_time))  # Clamp to valid range
+            else:
+                start_time = 0
+                
+        return start_time, clip_length
 
     def _apply_fades(self, clip: np.ndarray, fade_samples: int) -> None:
         """Apply fade in and fade out to the clip"""

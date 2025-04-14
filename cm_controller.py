@@ -631,7 +631,7 @@ class Controller:
                         "id": s.get("videoId", ""),
                         "title": self._clean(s.get("title", "")),
                         "artists": ", ".join(self._clean(a["name"]) for a in s.get("artists", [])),
-                        "duration": s.get("duration_seconds", 0)
+                        "duration": s.get("duration_seconds", 0) # Note: often is 0 from bad/missing metadata
                     }, filter(lambda s: s.get("videoId"), playlist.get("tracks", []))))
                 })
 
