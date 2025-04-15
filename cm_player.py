@@ -142,12 +142,10 @@ class AudioPlayer:
             ) as stream:
                 self.stream = stream
                 logger.info("Audio stream opened successfully")
-                self.player_queue.put("audio:stream opened successfully")
 
                 # Start buffering thread
                 self._buffer_thread.start()
                 logger.info("Buffer thread started")
-                self.player_queue.put("audio:buffer thread started")
 
                 # Process commands from the main process
                 while not self.stop_event.is_set():
@@ -265,13 +263,9 @@ class AudioPlayer:
         # Fill with silence and return early if we're paused or prefill isn't complete
         if self.paused or not self.prefill_complete.is_set():
             outdata.fill(0)
-            # Don't log status messages during initial prefill to avoid false alarms
-            if status and self.prefill_complete.is_set():
-                logger.warning("Audio device status: %s", status)
-                self.player_queue.put(f"audio:device status issue: {status}")
             return
 
-        # Now we can log any status issues since we're actually playing
+        # Should be valid data now - if not, log any status issues
         if status:
             logger.warning("Audio device status: %s", status)
             self.player_queue.put(f"audio:device status issue: {status}")
@@ -283,14 +277,9 @@ class AudioPlayer:
 
         if data is None:
             outdata.fill(0)
-            if self.buffer_underrun == False:
-                self.buffer_underrun = True
-                self.player_queue.put("audio:buffer underrun detected")
+            self.prefill_complete.clear()
+            self.player_queue.put(f"buffering:{self.current_song_id}:0")
             return
-        
-        if self.buffer_underrun:
-            self.buffer_underrun = False
-            self.player_queue.put("audio:playback resumed after buffer underrun")
         
         # Copy available data to output buffer
         if len(data) <= frames:

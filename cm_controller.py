@@ -112,8 +112,8 @@ class Controller:
             
         # Define message type priorities (higher number = higher priority)
         priorities = {
-            "playing": 6,
             "buffering": 5,
+            "playing": 6,
             "processing": 4,
             "download": 4,
             "audio": 2,
@@ -132,7 +132,7 @@ class Controller:
         if current_priority >= last_priority:
             # Higher or equal priority messages replace current message
             should_update = True
-        elif self.last_status_message_type == "playing" and self.paused:
+        elif self.last_status_message_type == "playing" and (self.paused or self.buffering):
             # If we're paused, allow lower priority messages to show
             should_update = True
         elif self.last_status_message_type is None:
@@ -159,7 +159,7 @@ class Controller:
                 # Initial status message
                 self._update_status("Initializing audio engine...", message_type="info")
 
-                config = self._save_config()
+                self.config = self._save_config()
                 audio_path = Path(self.view.audio_dir_var.get())
                 if not audio_path.is_absolute():
                     audio_path = Path(self.view.audio_dir_var.get()) / audio_path
@@ -176,7 +176,7 @@ class Controller:
                 self._update_status("Loading playlist...", message_type="info")
                 songs = self._load_and_upgrade_playlist(self.view.song_list_var.get())
                 
-                logger.debug(f"Starting with config: {config}")
+                logger.debug(f"Starting with config: {self.config}")
             
                 # Initialize songs_status list
                 for song in songs:
@@ -198,14 +198,14 @@ class Controller:
                 self._update_status("Starting audio processing...", message_type="info")
                 self.loader_process = mp.Process(
                     target=self._run_song_loader,
-                    args=(songs, config.to_dict(), self.processed_clips_queue, self.loader_queue)
+                    args=(songs, self.config.to_dict(), self.processed_clips_queue, self.loader_queue)
                 )
                 self.loader_process.start()
             
                 self.command_queue = mp.Queue()
                 self.player_process = mp.Process(
                     target=self._run_audio_player,
-                    args=(config.to_dict(), self.processed_clips_queue, self.command_queue, self.player_queue)
+                    args=(self.config.to_dict(), self.processed_clips_queue, self.command_queue, self.player_queue)
                 )
                 self.player_process.start()
                 self.playback_active = True
@@ -311,14 +311,12 @@ class Controller:
                     _, song_id, percent_buffered = message.split(":", 2)
                     song_id, percent_buffered = str(song_id), float(percent_buffered)
                     
-                    if percent_buffered < 1:
-                        self._update_status("Starting buffer fill...", message_type="buffering")
-                    elif percent_buffered < 99:
+                    if percent_buffered < 99:
+                        self.buffering = True
                         self._update_status(f"Buffering... {percent_buffered:.0f}%", message_type="buffering")
                     else:
+                        self.buffering = False
                         self._update_status("Buffering complete", message_type="buffering")
-                    
-                    if percent_buffered >= 99:
                         self.songs_status[song_id]['buffered'] = True
                         
                         # If a song was already playing (ie. buffering to catch up), show playing message again
@@ -331,6 +329,7 @@ class Controller:
                     _, song_id, title = message.split(":", 2)
                     if self.current_song['id'] is not None:
                         self.songs_status[self.current_song['id']]['played'] = True
+                    self.buffering = False
                     self.current_song = {'id': song_id, 'title': title}
                     song_index = self.songs_status[self.current_song['id']]['song']['index'] + 1
                     self._update_status(f"Playing {song_index}. {self.current_song['title']}", message_type="playing")
@@ -384,6 +383,7 @@ class Controller:
     def _reset_playback(self):
         self.playback_active = False
         self.paused = False
+        self.buffering = False
         self.processed_clips_queue: Optional[mp.Queue] = None
         self.loader_process: Optional[mp.Process] = None
         self.player_process: Optional[mp.Process] = None
@@ -625,6 +625,7 @@ class Controller:
         for i in range(len(playlists)):
             try:
                 playlist = self.ytmusic.get_playlist(playlists[i]['id'], limit=None)
+                logger.info(f"Playlist {json.dumps(playlist)}")
                 playlists[i].update({
                     'count': playlist.get('trackCount', 0),
                     'songs': list(map(lambda s: {

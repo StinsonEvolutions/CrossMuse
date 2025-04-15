@@ -43,6 +43,7 @@ class SongLoader:
         self.queue_not_empty = threading.Condition(self.queue_lock)  # Condition for queue not empty
         self.current_buffer_seconds = 0  # Current audio content length in seconds
         self.processed_songs = set()  # Set of processed song IDs
+        self.error_songs = Dict[str, Dict]
         self.last_song = None   # Last song processed
         self.last_cycle_songs = []  # Track the last N songs from previous cycle
         self.history_buffer_size = 0  # Will be set in start_processing
@@ -244,8 +245,13 @@ class SongLoader:
                     success = self._process_song(song, is_final_song)
                 
                     if success:
-                        self.ready_events[song['id']].set()  # Indicate that this song is ready
                         logger.info(f"Worker {worker_id} processed song {song['title']}")
+                    else:
+                        logger.error(f"Failed to process song {song['title']} - skipping")
+                        self.loader_queue.put(f"error:{song['id']}:{self.error_songs[song['id']].get('error')}")
+
+                    # Indicate that this song is ready (regardless of success - failure handled in worker)
+                    self.ready_events[song['id']].set()
                 
                 except Exception as e:
                     logger.error(f"Worker {worker_id} error processing song: {str(e)}")
@@ -264,6 +270,7 @@ class SongLoader:
         song_id = song['id']
         
         logger.info(f"Processing song {song_id}. {song['title']} (id: {song_id})")
+        success = False
 
         try:
             # Calculate clip timing parameters first
@@ -294,11 +301,11 @@ class SongLoader:
             self._apply_fades(audio, fade_samples)
             logger.info(f"Applied fades to {song['title']}")
             
-            # Wait until previous song has been processed
+            # Wait until previous song has been processed (or failed, in which case earlier tail used)
             if song['prevId'] is not None:
                 self.ready_events[song['prevId']].wait()
                 self.ready_events[song['prevId']].clear()
-
+            
             processed_clip = self._apply_crossfade(song_id, audio, fade_samples, is_final_song)
             logger.info(f"Applied crossfades to {song['title']}")
             # Store the tail for the next song
@@ -307,16 +314,16 @@ class SongLoader:
             # Send to player
             self.processed_clips.put((song_id, song['title'], processed_clip))
             logger.info(f"Sent processed clip for {song['title']} with length {len(processed_clip)}")
-        
+            success = True                
+            
+        except Exception as e:
+            self.error_songs[song_id] = {'song': song, 'error': str(e)}
+
+        finally:
             # Notify when the final song has been processed
             if is_final_song and not self.repeat_mode:
                 self.loader_queue.put("loader:complete")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to process {song['title']}: {str(e)}")
-            return False
+            return success
 
     def _download_song(self, song: Dict, start_time: int, duration: int, download_full: bool) -> str:
         """Downloads the song from YouTube using yt_dlp"""
@@ -406,8 +413,8 @@ class SongLoader:
         # Identify actual song length (handles case where bad metadata with missing duration)
         actual_length = len(audio) / 1000  # AudioSegment length is in milliseconds
         
-        # If start_time >= clip_length, recalculate using actual audio length
-        if start_time >= clip_length:
+        # If invalid timing values (resulting from "0" duration usually), recalculate using actual audio length
+        if downloaded_full and start_time >= clip_length:
             logger.info(f"Invalid clip timing detected. Recalculating based on actual audio length of {actual_length}s")
             start_time, clip_length = self._calculate_clip_timing(actual_length)
         
