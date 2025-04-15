@@ -1,72 +1,89 @@
-# CrossMuse 🎵  
+# CrossMuse 🎧
 
-**CrossMuse** is an open-source Python application that lets you experience your playlists in a dynamic new way—by playing seamless, crossfading song clips, much like a DJ mix. It downloads songs from a playlist JSON file (using [yt_dlp](https://github.com/yt-dlp/yt-dlp)), dynamically processes random clips, and begins playback once enough audio is pre-buffered.  
+Experience your music in a fresh way with **CrossMuse**, an open-source application that lets you seamlessly play crossfading clips from your favorite YouTube Music playlists. Discover new music and enjoy dynamic transitions, creating your own personalized DJ mix. **For more detailed information and usage instructions, be sure to check out the project Wiki.**
 
-🚀 **Current Features (Beta 0.1.0)**  
-✅ Loads playlists from a JSON file  
-✅ Downloads & caches songs locally  
-✅ Dynamically generates crossfaded clips  
-✅ Configurable clip length, prebuffer time, and crossfade duration  
-✅ Simple Tkinter GUI for playback controls  
+
+🚀 **Key Features**
+✅ Effortlessly search for, save, and load YouTube Music playlists directly within the app.
+✅ Downloads and locally caches songs using [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+✅ Dynamically generates crossfaded clips from songs.
+✅ Configurable clip length (including full song playback), crossfade duration, and prefill time.
+✅ Includes shuffle and repeat playback options with intelligent shuffle logic.
+✅ User-friendly Tkinter GUI with intuitive controls for playback and configuration.
 
 ---
 
 ## 🖥️ Quickstart
 
-A prebuilt **Windows executable** is available for download on the [Releases](https://github.com/yourusername/CrossMuse/releases) page. Simply:  
+A prebuilt **Windows executable** is available for download on the [Releases](https://github.com/StinsonEvolutions/CrossMuse/releases) page. Simply:
 
 1. **Download** `CrossMuse.exe` from the latest release.
-2. **Run** `CrossMuse.exe` (no installation required).  
+2. **Run** `CrossMuse.exe` (no installation required).
 
-Note: The `.exe` version is self-contained but may trigger security warnings (since it's unsigned). If you prefer, you can run CrossMuse directly from source (see below).  
+Note: The `.exe` version is self-contained but may trigger security warnings (since it's unsigned). If you prefer, you can run CrossMuse directly from source (see below). A background console window will appear when running the `.exe`; this can be minimized but must remain open.
 
 ---
 
 ## 📥 Installation & Running Locally
 
-1️. **Clone the Repository**  
+1️. **Clone the Repository**
 ```
-git clone https://github.com/yourusername/CrossMuse.git
+
+git clone [https://github.com/StinsonEvolutions/CrossMuse.git](https://www.google.com/search?q=https://github.com/StinsonEvolutions/CrossMuse.git)
 cd CrossMuse
+
 ```
-2️. **Install Dependencies**  
+2️. **Install Dependencies**
 ```
+
 pip install -r requirements.txt
+
 ```
-3️. **Run the Application**  
+3️. **Run the Application**
 ```
-python cm_main.py
+
+python cm\_main.py
+
 ```
+
+A console window will appear behind the main application window; this can be minimized if desired, but must remain open while the application is running.
 
 ---
 
-## 📦 Packaging as a Standalone App  
+## 📦 Packaging as a Standalone App
 
-For Windows users who prefer a single `.exe`, you can package CrossMuse with:  
+For Windows users who prefer a single `.exe`, you can package CrossMuse with:
 ```
-pyinstaller --onefile --noconsole --add-data "path\\to\\Sample Playlists\\*;Sample Playlists" --add-data "path\\to\\logo.png;." --name "CrossMuse" cm_main.py
+
+pyinstaller --onefile --collect-all ytmusicapi --add-data "Sample Playlists\*;Sample Playlists" --add-data "logo.png;." --name "CrossMuse" cm\_main.py
+
 ```
-This creates a **self-contained executable** with no extra setup required.
+This creates a **self-contained executable** with no extra setup required. Note that the `--noconsole` option is intentionally omitted to provide a background console window for ffmpeg output.
 
 ---
 
-## 💡 Why CrossMuse?  
+## 💡 Why CrossMuse?
 
-Streaming services like Spotify offer basic crossfade, but sometimes you want a **quick, DJ-style mix of your playlist**. CrossMuse provides a **free, open-source way** to blend tracks smoothly without limitations.
+Tired of static playlists? CrossMuse offers a unique and customizable DJ-style music experience. While some services provide basic crossfade, CrossMuse lets you:
+
+- **Effortlessly discover and manage playlists:** Search, save, and load YouTube Music playlists directly within the app.
+- **Create dynamic mixes:** Enjoy seamless crossfades between songs or configurable clips.
+- **Customize your listening:** Set clip lengths (from short snippets to full songs), crossfade durations, and enable shuffle or repeat.
+- **Experiment with playback:** Create lively mixes with short clips or smooth ambient flows with long crossfades.
 
 ---
 
-## ⚠️ Legal Disclaimer  
+## ⚠️ Legal Disclaimer
 
-CrossMuse and its contributors **are not responsible** for any copyright infringement arising from downloading songs. **Use responsibly and comply with all applicable laws.**  
+CrossMuse and its contributors **are not responsible** for any copyright infringement arising from downloading songs. **Use responsibly and comply with all applicable laws.**
 
 ---
 
-## 🤝 Contributing & Feedback  
+## 🤝 Contributing & Feedback
 
-We’d love your help in making CrossMuse better!  
-✅ **Report bugs & suggest features** via GitHub Issues  
-✅ **Contribute code** by forking & submitting a pull request  
-✅ **Stay updated** by checking out our [Wiki](https://github.com/yourusername/CrossMuse/wiki)  
+We'd love your help in making CrossMuse even better!
+✅ **Report bugs & suggest features** via GitHub Issues
+✅ **Contribute code** by forking & submitting a pull request
+✅ **Stay updated** by checking out our [Wiki](https://github.com/StinsonEvolutions/CrossMuse/wiki)
 
-🎧 **Enjoy your new way of experiencing music!**
+🎧 **Enjoy your new and dynamic way of experiencing music!**
