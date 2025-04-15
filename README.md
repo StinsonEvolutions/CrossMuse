@@ -4,11 +4,12 @@ Experience your music in a fresh way with **CrossMuse**, an open-source applicat
 
 
 🚀 **Key Features**
-✅ Effortlessly search for, save, and load YouTube Music playlists directly within the app.
-✅ Downloads and locally caches songs using [yt-dlp](https://github.com/yt-dlp/yt-dlp).
-✅ Dynamically generates crossfaded clips from songs.
-✅ Configurable clip length (including full song playback), crossfade duration, and prefill time.
-✅ Includes shuffle and repeat playback options with intelligent shuffle logic.
+
+✅ Effortlessly search for, save, and load YouTube Music playlists directly within the app.  
+✅ Downloads and locally caches songs using [yt-dlp](https://github.com/yt-dlp/yt-dlp).  
+✅ Dynamically generates crossfaded clips from songs.  
+✅ Configurable clip length (including full song playback), crossfade duration, and prefill time.  
+✅ Includes shuffle and repeat playback options with intelligent shuffle logic.  
 ✅ User-friendly Tkinter GUI with intuitive controls for playback and configuration.
 
 ---
