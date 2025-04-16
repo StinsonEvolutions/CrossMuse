@@ -89,62 +89,6 @@ class Controller:
     def _on_shift_mouse_wheel(self, event):
         """Scroll horizontally with shift + mouse wheel."""
         self.view.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
-    
-    def _update_status(self, message: str, message_type: str = "info", is_error: bool = False) -> bool:
-        """
-        Centralized status message handler with priority management.
-        
-        Args:
-            message: The status message to display
-            message_type: Type of message for priority determination 
-                        ("playing", "processing", "download", "buffering", "audio", "info")
-            is_error: Whether this is an error message
-        
-        Returns:
-            bool: True if the message was displayed, False if suppressed due to priority
-        """
-        logger.info(f"Status update [{message_type}]: {message}")
-        
-        # Error messages always get displayed regardless of priority
-        if is_error:
-            self.view.update_status(message, is_error=True)
-            return True
-            
-        # Define message type priorities (higher number = higher priority)
-        priorities = {
-            "buffering": 5,
-            "playing": 6,
-            "processing": 4,
-            "download": 4,
-            "audio": 2,
-            "info": 1
-        }
-        
-        # Get priority of current message
-        current_priority = priorities.get(message_type, 1)
-        
-        # Get priority of last message type
-        last_priority = priorities.get(self.last_status_message_type, 0)
-        
-        # Determine if we should update the status based on priority
-        should_update = False
-        
-        if current_priority >= last_priority:
-            # Higher or equal priority messages replace current message
-            should_update = True
-        elif self.last_status_message_type == "playing" and (self.paused or self.buffering):
-            # If we're paused, allow lower priority messages to show
-            should_update = True
-        elif self.last_status_message_type is None:
-            # If no previous message, always show
-            should_update = True
-            
-        if should_update:
-            self.view.update_status(message, is_error=is_error)
-            self.last_status_message_type = message_type
-            return True
-        
-        return False
 
     def _start_playback(self):
         """Handle playback start/resume."""
@@ -266,15 +210,10 @@ class Controller:
                 
                 elif message.startswith("error:"):
                     # Handle error messages from the loader
-                    _, song_id, error_message = message.split(":", 2)
-                    song_title = self.songs_status[song_id]['song']['title']
-                    error_text = f"Error processing {song_title}: {error_message}"
-                    logger.error(error_text)
-                    self._update_status(error_text, message_type="info", is_error=True)
+                    _, error_message = message.split(":", 1)
+                    logger.error(f"Loader error: {error_message}")
+                    self._update_status(error_message, message_type="error", is_error=True)
                     
-                    # Mark the song as having an error
-                    self.songs_status[song_id]['error'] = True
-                
                 elif message == "loader:complete":
                     # All songs have been processed, force playback to start if needed
                     logger.info("Received loader completion notification, forcing playback to start if needed")
@@ -334,13 +273,76 @@ class Controller:
                     song_index = self.songs_status[self.current_song['id']]['song']['index'] + 1
                     self._update_status(f"Playing {song_index}. {self.current_song['title']}", message_type="playing")
                     
-                elif message.startswith("audio:"):
-                    # Audio system messages have lower priority
+                elif message.startswith("error:"):
+                    # Error messages from the player have top priority
+                    _, error_message = message.split(":", 1)
+                    logger.error(f"Player error: {error_message}")
+                    self._update_status(error_message, message_type="error", is_error=True)
+                    
+                elif message.startswith("info:"):
+                    # Info messages have lower priority
                     _, status_msg = message.split(":", 1)
-                    self._update_status(f"Audio system: {status_msg}", message_type="audio")
+                    self._update_status(f"{status_msg}", message_type="info")
 
             except queue.Empty:
                 break
+
+    def _update_status(self, message: str, message_type: str = "info", is_error: bool = False) -> bool:
+        """
+        Centralized status message handler with priority management.
+        
+        Args:
+            message: The status message to display
+            message_type: Type of message for priority determination 
+                        ("playing", "processing", "download", "buffering", "audio", "info", "error")
+            is_error: Whether this is an error message
+        
+        Returns:
+            bool: True if the message was displayed, False if suppressed due to priority
+        """
+        logger.info(f"Status update [{message_type}]: {message}")
+        
+        # Define message type priorities (higher number = higher priority)
+        priorities = {
+            "error": 6,
+            "playing": 6,
+            "buffering": 4,
+            "processing": 4,
+            "download": 4,
+            "info": 2
+        }
+        
+        # Error messages always get displayed regardless of priority
+        if is_error or message_type == "error":
+            self.view.update_status(message, is_error=True)
+            self.last_status_message_type = message_type
+            return True
+            
+        # Get priority of current message
+        current_priority = priorities.get(message_type, 1)
+        
+        # Get priority of last message type
+        last_priority = priorities.get(self.last_status_message_type, 0)
+        
+        # Determine if we should update the status based on priority
+        should_update = False
+        
+        if current_priority >= last_priority:
+            # Higher or equal priority messages replace current message
+            should_update = True
+        elif self.last_status_message_type == "playing" and (self.paused or self.buffering):
+            # If we're paused, allow lower priority messages to show
+            should_update = True
+        elif self.last_status_message_type is None:
+            # If no previous message, always show
+            should_update = True
+            
+        if should_update:
+            self.view.update_status(message, is_error=is_error)
+            self.last_status_message_type = message_type
+            return True
+        
+        return False
 
     def _toggle_pause(self):
         """Toggle pause state."""

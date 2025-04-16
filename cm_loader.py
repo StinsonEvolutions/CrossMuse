@@ -26,16 +26,16 @@ class SongLoader:
     """Handles song download, processing, and clip generation in background threads."""
     def __init__(self, config: AudioConfig, processed_clips_queue: mp.Queue):
         """Initialize song loader with output directory and results queue."""
-        self.config = config
-        self.processed_clips = processed_clips_queue
-        self.loader_queue = None
-        self.songs: List[Dict] = []
-        self.max_workers = min(4, processed_clips_queue._maxsize)
-        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
-        self.previous_tail: Optional[np.ndarray] = None
-        self.complete_event = threading.Event()
-        self.repeat_mode = config.repeat
-        self.shuffle_mode = config.shuffle
+        self.config = config # Audio configuration
+        self.processed_clips = processed_clips_queue # Queue for processed clips
+        self.loader_queue = None # Queue for loader process
+        self.songs: List[Dict] = [] # List of songs to process
+        self.max_workers = min(4, processed_clips_queue._maxsize) # Limit to 4 workers or max queue size
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers) # Thread pool for concurrent processing
+        self.previous_tail: Optional[np.ndarray] = None # Previous tail for concatenation
+        self.complete_event = threading.Event() # Event to signal completion
+        self.repeat_mode = config.repeat # Repeat mode
+        self.shuffle_mode = config.shuffle # Shuffle mode
         
         # Processing queue and related variables
         self.processing_queue = deque()  # Queue of songs to process
@@ -43,13 +43,13 @@ class SongLoader:
         self.queue_not_empty = threading.Condition(self.queue_lock)  # Condition for queue not empty
         self.current_buffer_seconds = 0  # Current audio content length in seconds
         self.processed_songs = set()  # Set of processed song IDs
-        self.error_songs = Dict[str, Dict]
+        self.error_songs: Dict[str, str] = {}  # Dictionary to track errors for songs
         self.last_song = None   # Last song processed
         self.last_cycle_songs = []  # Track the last N songs from previous cycle
         self.history_buffer_size = 0  # Will be set in start_processing
         self.worker_threads = []  # List of worker threads
         self.current_cycle = 0  # Current playlist cycle
-        self.ready_events: Dict[str, threading.Event] = {}
+        self.ready_events: Dict[str, threading.Event] = {} # Dictionary to track song readiness
     
         # Track clip lengths for processed_clips queue
         self.clip_lengths = deque()  # Store lengths of clips in the processed_clips queue
@@ -197,7 +197,7 @@ class SongLoader:
         self.last_song = song['id']
 
         # Add the song to the queue with the final song flag
-        self.processing_queue.append((song, is_final_song))
+        self.processing_queue.append((song, self.current_cycle, is_final_song))
     
         # Update the current buffer seconds
         song_duration = song.get('duration', self.config.clip_length)
@@ -228,6 +228,7 @@ class SongLoader:
             # Get the next song from the queue
             song = None
             is_final_song = False
+            cycle = 0
 
             with self.queue_lock:
                 
@@ -236,22 +237,21 @@ class SongLoader:
                     self.queue_not_empty.wait(timeout=1.0)
 
                 if len(self.processing_queue) > 0:
-                    song, is_final_song = self.processing_queue.popleft()
+                    song, cycle, is_final_song = self.processing_queue.popleft()
                     self.processed_songs.add(song['id'])  # Mark the song as processed
         
             if song:
                 try:
                     # Process the song
-                    success = self._process_song(song, is_final_song)
+                    success = self._process_song(song, cycle, is_final_song)
+                    # Indicate that this song is ready (regardless of success - failure handled in worker)
+                    self.ready_events[song['id']].set()
                 
                     if success:
                         logger.info(f"Worker {worker_id} processed song {song['title']}")
                     else:
                         logger.error(f"Failed to process song {song['title']} - skipping")
-                        self.loader_queue.put(f"error:{song['id']}:{self.error_songs[song['id']].get('error')}")
-
-                    # Indicate that this song is ready (regardless of success - failure handled in worker)
-                    self.ready_events[song['id']].set()
+                        self.loader_queue.put(f"error:{song['id']}:{self.error_songs.get(song['id'])}")
                 
                 except Exception as e:
                     logger.error(f"Worker {worker_id} error processing song: {str(e)}")
@@ -265,11 +265,11 @@ class SongLoader:
     
         logger.info(f"Worker {worker_id} stopped")
     
-    def _process_song(self, song: Dict, is_final_song: bool) -> bool:
+    def _process_song(self, song: Dict, cycle: int, is_final_song: bool) -> bool:
         """Process a single song - download, process, and send to player."""
         song_id = song['id']
         
-        logger.info(f"Processing song {song_id}. {song['title']} (id: {song_id})")
+        logger.info(f"Processing song {song_id}. {song['title']} (id: {song_id}) for cycle {cycle}")
         success = False
 
         try:
@@ -283,16 +283,15 @@ class SongLoader:
             
             # Download the song
             download_full = (clip_length > song_duration * 0.5) if song_duration > 0 else True
-            file_path = self._download_song(song, start_time, clip_length, download_full)
+            file_path = self._download_song(song, cycle, start_time, clip_length, download_full)
             logger.info(f"Downloaded {song['title']} to path {file_path}")
             
             # Load and process the audio
             self.loader_queue.put(f"processing:{song_id}")
             audio = self._load_and_process(file_path, start_time, clip_length, download_full)
         
-            # Adjust clip length if needed based on actual audio length
-            if clip_length == 0 or clip_length > len(audio) / self.config.sample_rate:
-                clip_length = len(audio) / self.config.sample_rate
+            # Adjust clip length to match actual audio length
+            clip_length = len(audio) / self.config.sample_rate
             logger.info(f"Processed {song['title']} with clip length {clip_length}")
 
             fade_samples = int(min(self.config.fade_duration, clip_length / 2) * self.config.sample_rate)
@@ -306,6 +305,7 @@ class SongLoader:
                 self.ready_events[song['prevId']].wait()
                 self.ready_events[song['prevId']].clear()
             
+            # Produce the crossfaded clip
             processed_clip = self._apply_crossfade(song_id, audio, fade_samples, is_final_song)
             logger.info(f"Applied crossfades to {song['title']}")
             # Store the tail for the next song
@@ -317,7 +317,7 @@ class SongLoader:
             success = True                
             
         except Exception as e:
-            self.error_songs[song_id] = {'song': song, 'error': str(e)}
+            self.error_songs[song_id] = str(e)
 
         finally:
             # Notify when the final song has been processed
@@ -325,7 +325,7 @@ class SongLoader:
                 self.loader_queue.put("loader:complete")
             return success
 
-    def _download_song(self, song: Dict, start_time: int, duration: int, download_full: bool) -> str:
+    def _download_song(self, song: Dict, cycle: int, start_time: int, duration: int, download_full: bool) -> str:
         """Downloads the song from YouTube using yt_dlp"""
         song_id = song['id']
         song_url = f"{AudioConfig.YOUTUBE_MUSIC_VIDEO_URL_PREFIX}{song_id}"
@@ -367,7 +367,9 @@ class SongLoader:
                 base_filepath = ydl.prepare_filename(info).rsplit('.', 1)[0]
                 base_filename = os.path.basename(base_filepath)
                 base_filepath += ".mp3"
-                desired_filepath = os.path.join(self.config.audio_dir, f"{self.sanitize_filename(base_filename)}_{song_id}.mp3")
+                # Set a unique name for this song and cycle
+                # (overwriting on separate playback but not cycle, in case same song in queue twice)
+                desired_filepath = os.path.join(self.config.audio_dir, f"{self.sanitize_filename(base_filename)}_{song_id}_{cycle}.mp3")
 
                 # Note: only downloading clip, so download and overwrite every time
                 self.loader_queue.put(f"download:{song['id']}:0")
@@ -487,7 +489,8 @@ class SongLoader:
                 processed_clip = clip[:-fade_samples]
         # Otherwise, apply crossfade with previous tail
         else:
-            crossfade = self.previous_tail + clip[:fade_samples]
+            # Create a crossfade array combining previous tail with current clip (ensuring correct length)
+            crossfade = self.previous_tail + clip[:len(self.previous_tail)]
             # For the final song, include the fade out portion
             if is_final_song and not self.repeat_mode:
                 processed_clip = np.concatenate([crossfade, clip[fade_samples:]])

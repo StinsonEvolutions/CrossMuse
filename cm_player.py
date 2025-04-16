@@ -23,11 +23,11 @@ class AtomicBuffer:
         """Initializes AtomicBuffer"""
         self.config = config
         available_memory = psutil.virtual_memory().available
-        buffer_size = min(int(config.buffer_seconds * config.sample_rate), available_memory // 2)
-        buffer_size = (buffer_size // config.block_size) * config.block_size  # Ensure buffer size is a multiple of block size
-        logger.info(f"Allocating {buffer_size // config.sample_rate} second buffer")
+        self.buffer_size = min(int(config.buffer_seconds * config.sample_rate), available_memory // 2)
+        self.buffer_size = (self.buffer_size // config.block_size) * config.block_size  # Ensure buffer size is a multiple of block size
+        logger.info(f"Allocating {self.buffer_size // config.sample_rate} second buffer")
         self.buffer = np.zeros(
-            (buffer_size, config.channels),
+            (self.buffer_size, config.channels),
             dtype=np.float32
         )
         # Keep track of song id hashes for each block
@@ -110,6 +110,7 @@ class AudioPlayer:
         self.processed_clips_queue = processed_clips_queue
         self.player_queue = None
         self.buffer = AtomicBuffer(config)
+        self.prefill_time = min(config.prefill_time, self.buffer.buffer_size / config.sample_rate)
         self.stream: Optional[sd.OutputStream] = None
         self.stop_event = threading.Event()
         self.prefill_complete = threading.Event()
@@ -129,7 +130,7 @@ class AudioPlayer:
         self.player_queue = player_queue
         try:
             logger.info("Starting playback...")
-            self.player_queue.put("audio:initializing sound device")
+            self.player_queue.put("info:Initializing sound device...")
 
             # Open audio stream
             logger.info(f"Opening audio stream with sample_rate={self.config.sample_rate}, channels={self.config.channels}")
@@ -153,22 +154,20 @@ class AudioPlayer:
                         cmd = command_queue.get_nowait()
                         logger.info(f"Received command: {cmd}")
                         if cmd == "PAUSE":
-                            logger.info("Playback paused")
-                            self.player_queue.put("audio:pausing playback")
+                            logger.info("Pausing playback...")
                             self._handle_pause_fade()
-                            self.player_queue.put("audio:playback paused")
+                            self.player_queue.put("info:Playback paused")
                         elif cmd == "RESUME":
-                            logger.info("Playback resumed")
-                            self.player_queue.put("audio:resuming playback")
+                            logger.info("Resuming playback...")
                             self._handle_resume_fade()
-                            self.player_queue.put("audio:playback resumed")
+                            self.player_queue.put("info:Playback resumed")
                         elif cmd == "FORCE_START" and not self.prefill_complete.is_set():
-                            logger.info("Forcing playback to start despite buffer not being fully prefilled")
-                            self.player_queue.put("audio:forcing playback to start")
+                            logger.info("Forcing playback to start before buffer is fully prefilled...")
                             self.prefill_complete.set()
+                            self.player_queue.put("info:Playback started")
                         elif cmd == "STOP":
                             logger.info("Stopping playback...")
-                            self.player_queue.put("audio:stopping playback")
+                            self.player_queue.put("info:Playback stopped")
                             break
                     except queue.Empty:
                         pass
@@ -177,52 +176,40 @@ class AudioPlayer:
 
         except Exception as e:
             logger.error("Playback failed: %s", str(e))
-            self.player_queue.put(f"audio:playback failed: {str(e)}")
+            self.player_queue.put(f"error:Playback failed: {str(e)}")
         finally:
             self.stop()
 
     def _buffer_loop(self) -> None:
         """Unified buffering loop handling both prefill and continuous loading."""
         start_time = time.time()
-        logger.info("Starting buffering system (target: %.1fs)", self.config.prefill_time)
-        self.player_queue.put(f"audio:starting buffer fill (target: {self.config.prefill_time}s)")
+        logger.info("Starting buffering system (target: %.1fs)", self.prefill_time)
+        self.player_queue.put(f"info:Starting buffer fill (target: {self.prefill_time}s)")
 
         while not self.stop_event.is_set():
             try:
                 song_id, title, clip = self.processed_clips_queue.get(timeout=0.1)
                 if (song_id, title, clip) == (None, None, None):
                     self.buffer.loader_complete = True  # Signal that no more data is coming
-                    logger.debug("Received loader completion signal")
-                    self.player_queue.put("audio:all songs processed")
+                    logger.info("Received loader completion signal")
                     break
 
                 logger.info(f"Player received processed clip {song_id}. {title} with {len(clip)}")
-                self.player_queue.put(f"audio:received clip for {title}")
                 self.song_list[song_id] = title
                 
                 self._safe_buffer(clip, song_id)
-
-                # Trigger garbage collection if memory usage is high
-                if psutil.virtual_memory().percent > 80:
-                    gc.collect()
-                    self.player_queue.put("audio:performed memory cleanup")
 
             except queue.Empty:
                 # Might just be slow processing - wait for more clips
                 logger.debug("No clips available, waiting...")
                 time.sleep(0.1)
 
-        logger.info(
-            "Buffering completed, final buffer level: %.1fs",
-            self.buffer.available_seconds()
-        )
-        self.player_queue.put(f"audio:buffer fill complete ({self.buffer.available_seconds():.1f}s)")
-
+        self.player_queue.put("info:All songs processed")
 
     def _safe_buffer(self, audio: np.ndarray, song_id: str) -> None:
         """Safely write audio data to buffer with flow control."""
         audio_written = 0
-        prefill_target = self.config.prefill_time * self.config.sample_rate
+        prefill_target = self.prefill_time * self.config.sample_rate
         
         # Create hash for the song_id and store in the mapping dictionary
         id_hash = self._hash_int32(song_id)
@@ -251,10 +238,12 @@ class AudioPlayer:
 
                     if buffer_level >= prefill_target:
                         logger.info("Prefill target reached (%.1fs)", buffer_level / self.config.sample_rate)
-                        self.player_queue.put(f"audio:prefill target reached ({buffer_level / self.config.sample_rate:.1f}s)")
+                        self.player_queue.put(f"info:Prefill target reached ({buffer_level / self.config.sample_rate:.1f}s)")
                         self.prefill_complete.set()
             else:
                 time.sleep(self.config.buffer_backoff)
+
+        logger.info(f"Buffered {audio_written} samples for song {song_id}")
 
 
     def _audio_callback(self, outdata: np.ndarray, frames: int,
@@ -262,13 +251,14 @@ class AudioPlayer:
         """Core audio callback handling buffer reading and signal processing."""
         # Fill with silence and return early if we're paused or prefill isn't complete
         if self.paused or not self.prefill_complete.is_set():
+            #logger.info(f"Audio callback paused or prefill not complete: {self.paused}, {self.prefill_complete.is_set()}")
             outdata.fill(0)
             return
 
         # Should be valid data now - if not, log any status issues
         if status:
             logger.warning("Audio device status: %s", status)
-            self.player_queue.put(f"audio:device status issue: {status}")
+            self.player_queue.put(f"error:Device status issue: {status}")
 
         data, id_hash, is_final_read = self.buffer.read(frames)
 
@@ -291,7 +281,6 @@ class AudioPlayer:
 
         if is_final_read:
             logger.info("Playback finished, signaling complete.")
-            self.player_queue.put("audio:reached end of playlist")
             self.player_queue.put("playback:complete")
             raise sd.CallbackStop()
 
